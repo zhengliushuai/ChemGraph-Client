@@ -1,0 +1,140 @@
+import argparse
+import logging
+import os
+import sys
+
+import uvicorn
+from mcp.server.fastmcp import FastMCP
+
+
+def run_mcp_server(
+    mcp: FastMCP, default_port: int = 8000, default_host: str = "127.0.0.1"
+):
+    """Standardize the startup process for ChemGraph MCP servers.
+
+    Supports 'stdio' (default) and 'sse' (HTTP) transports.
+    Ensures logging is correctly routed to stderr to avoid corrupting stdio transport.
+
+    Parameters
+    ----------
+    mcp : FastMCP
+        MCP server instance to run.
+    default_port : int, optional
+        Default port for streamable HTTP transport.
+    default_host : str, optional
+        Default host for streamable HTTP transport.
+    """
+    parser = argparse.ArgumentParser(description=f"Run {mcp.name} MCP Server")
+    parser.add_argument(
+        "--transport",
+        choices=["stdio", "streamable_http"],
+        default="stdio",
+        help="Transport protocol to use: 'stdio' (default) or 'streamable_http' (HTTP/SSE).",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=default_port,
+        help=f"Port for streamable_http transport (default: {default_port})",
+    )
+    parser.add_argument(
+        "--host",
+        type=str,
+        default=default_host,
+        help=f"Host for streamable_http transport (default: {default_host})",
+    )
+
+    args = parser.parse_args()
+
+    # Configure logging to write to stderr.
+    # This is CRITICAL for stdio transport mode, as stdout is used for communication.
+    logger = logging.getLogger()
+    logger.setLevel(logging.INFO)
+    formatter = logging.Formatter(
+        "%(asctime)s - %(levelname)s - %(name)s - %(message)s"
+    )
+
+    # Always log to stderr
+    stderr_handler = logging.StreamHandler(sys.stderr)
+    stderr_handler.setFormatter(formatter)
+    logger.addHandler(stderr_handler)
+
+    # If CHEMGRAPH_LOG_DIR is set, also log to a file
+    log_dir = os.environ.get("CHEMGRAPH_LOG_DIR")
+    if log_dir:
+        try:
+            os.makedirs(log_dir, exist_ok=True)
+            log_file = os.path.join(log_dir, f"mcp_server_{mcp.name}.log")
+            file_handler = logging.FileHandler(log_file)
+            file_handler.setFormatter(formatter)
+            logger.addHandler(file_handler)
+            logging.info(f"Logging to file: {log_file}")
+        except Exception as e:
+            logging.error(f"Failed to setup file logging to {log_dir}: {e}")
+
+    if args.transport == "streamable_http":
+        logging.info(
+            "Starting %s on %s:%s via streamable_http transport...",
+            mcp.name,
+            args.host,
+            args.port,
+        )
+        # FastMCP.streamable_http_app() returns a Starlette/FastAPI-compatible app
+        app = mcp.streamable_http_app()
+        # The streamable-HTTP transport does not use WebSockets. Keep the
+        # optional WebSocket protocol disabled to avoid loading an unused
+        # protocol stack.
+        uvicorn.run(app, host=args.host, port=args.port, ws="none")
+    else:
+        logging.info("Starting %s via stdio transport...", mcp.name)
+        # Under stdio, the server's stdout IS the JSON-RPC channel. Any
+        # unguarded print from a worker (e.g. mace's "cuequivariance ...
+        # will be disabled" notice) would corrupt it. setdefault so the
+        # user can override with CHEMGRAPH_LOCAL_SILENCE_STDOUT=0.
+        os.environ.setdefault("CHEMGRAPH_LOCAL_SILENCE_STDOUT", "1")
+        # FastMCP.run(transport='stdio') handles the stdio loop
+        mcp.run(transport="stdio")
+
+
+# ---------------------------------------------------------------------------
+# Parsl HPC configuration loader
+# ---------------------------------------------------------------------------
+
+
+def load_parsl_config(system_name: str):
+    """Dynamically import and return a Parsl config for the given HPC system.
+
+    Parameters
+    ----------
+    system_name : str
+        Target system name.  Supported: ``polaris``, ``aurora``.
+
+    Returns
+    -------
+    parsl.config.Config
+        Parsl configuration object for the requested system.
+
+    Raises
+    ------
+    ValueError
+        If the system name is not recognised.
+    """
+    system_name = system_name.lower()
+    run_dir = os.getcwd()
+
+    logging.info("Initializing Parsl for system: %s", system_name)
+
+    if system_name == "polaris":
+        from chemgraph.hpc_configs.polaris_parsl import get_polaris_config
+
+        return get_polaris_config(run_dir=run_dir)
+
+    elif system_name == "aurora":
+        from chemgraph.hpc_configs.aurora_parsl import get_aurora_config
+
+        return get_aurora_config(run_dir=run_dir)
+
+    else:
+        raise ValueError(
+            f"Unknown system specified: '{system_name}'. Supported: polaris, aurora"
+        )

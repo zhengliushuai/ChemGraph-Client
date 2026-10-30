@@ -1,0 +1,360 @@
+"""3-D molecular structure visualisation components for the Streamlit UI."""
+
+import json
+import re as _re
+
+import numpy as np
+import pandas as pd
+import streamlit as st
+from ase.data import chemical_symbols
+
+from chemgraph.tools.ase_core import create_ase_atoms, create_xyz_string
+
+# ---------------------------------------------------------------------------
+# Optional py3Dmol availability
+# ---------------------------------------------------------------------------
+
+try:
+    import py3Dmol
+
+    PY3DMOL_AVAILABLE = True
+except ImportError:
+    py3Dmol = None
+    PY3DMOL_AVAILABLE = False
+
+# Default viewer height in pixels; width always follows the container.
+VIEWER_HEIGHT = 420
+
+
+def render_py3dmol(view, height: int = VIEWER_HEIGHT) -> None:
+    """Embed a py3Dmol view at full container width.
+
+    Replaces the unmaintained ``stmol`` shim: py3Dmol renders itself to
+    a self-contained HTML snippet that Streamlit can embed directly.
+
+    Parameters
+    ----------
+    view : py3Dmol.view
+        Configured viewer.
+    height : int, optional
+        Component height in pixels.
+    """
+    st.components.v1.html(view._make_html(), height=height + 8, scrolling=False)
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+
+def _stable_key(prefix: str, title: str) -> str:
+    """Return a deterministic Streamlit widget key derived from *title*.
+
+    Using ``uuid4()`` caused widget keys to change on every rerun, which
+    reset user selections (e.g. the style selectbox) and leaked stale
+    widget state in memory.
+
+    Parameters
+    ----------
+    prefix : str
+        Widget key prefix.
+    title : str
+        Viewer title used to derive the key suffix.
+
+    Returns
+    -------
+    str
+        Stable Streamlit widget key.
+    """
+    slug = _re.sub(r"[^a-z0-9]+", "_", title.lower()).strip("_")
+    return f"{prefix}_{slug}"
+
+
+def warn_viewer_unavailable() -> None:
+    """Display a one-time warning when py3Dmol is not installed."""
+    if PY3DMOL_AVAILABLE or st.session_state.get("_viewer_warning_shown"):
+        return
+
+    st.session_state["_viewer_warning_shown"] = True
+    st.warning("**py3Dmol** not available -- falling back to text/table view.")
+    st.info("To enable 3D visualization, install with: `pip install py3Dmol`")
+
+
+def create_ase_atoms_with_streamlit_error(atomic_numbers, positions):
+    """Create ASE atoms and display Streamlit errors on failure.
+
+    Parameters
+    ----------
+    atomic_numbers : sequence
+        Atomic numbers for each atom.
+    positions : sequence
+        Cartesian coordinates for each atom.
+
+    Returns
+    -------
+    ase.Atoms or None
+        Constructed atoms object, or ``None`` if creation fails.
+    """
+    atoms = create_ase_atoms(atomic_numbers, positions)
+    if atoms is None:
+        st.error("Error creating ASE Atoms object")
+    return atoms
+
+
+def display_molecular_structure(atomic_numbers, positions, title="Structure") -> bool:
+    """Render an interactive 3-D molecular viewer with info panel.
+
+    Returns ``True`` on success, ``False`` on error.
+
+    Parameters
+    ----------
+    atomic_numbers : sequence
+        Atomic numbers for each atom.
+    positions : sequence
+        Cartesian coordinates for each atom.
+    title : str, optional
+        Title displayed above the structure viewer.
+
+    Returns
+    -------
+    bool
+        ``True`` when the structure is rendered successfully.
+    """
+    try:
+        atoms = create_ase_atoms_with_streamlit_error(atomic_numbers, positions)
+        if atoms is None:
+            return False
+
+        xyz_string = create_xyz_string(atomic_numbers, positions)
+        if xyz_string is None:
+            return False
+
+        st.subheader(f"\U0001f9ec {title}")
+        col1, col2 = st.columns([2, 1])
+
+        # 3-D panel --------------------------------------------------------
+        with col1:
+            if PY3DMOL_AVAILABLE:
+                style_options = ["ball_and_stick", "stick", "sphere", "wireframe"]
+                selected_style = st.selectbox(
+                    "Visualization Style",
+                    style_options,
+                    key=_stable_key("style", title),
+                )
+
+                try:
+                    view = py3Dmol.view(width="100%", height=VIEWER_HEIGHT)
+                    view.addModel(xyz_string, "xyz")
+
+                    if selected_style == "ball_and_stick":
+                        view.setStyle({"stick": {}, "sphere": {"scale": 0.3}})
+                    elif selected_style == "stick":
+                        view.setStyle({"stick": {}})
+                    elif selected_style == "sphere":
+                        view.setStyle({"sphere": {}})
+                    elif selected_style == "wireframe":
+                        view.setStyle({"line": {}})
+                    else:
+                        view.setStyle({"stick": {}, "sphere": {"scale": 0.3}})
+
+                    view.zoomTo()
+                    render_py3dmol(view)
+
+                except Exception as viz_error:
+                    st.error(f"3D visualization error: {viz_error}")
+                    st.info("Falling back to table view...")
+                    _render_structure_table(atomic_numbers, positions)
+            else:
+                st.info("3-D viewer unavailable; showing raw XYZ and table.")
+                with st.expander("\U0001f4c4 XYZ Format", expanded=True):
+                    st.code(xyz_string, language="text")
+                _render_structure_table(atomic_numbers, positions)
+
+        # Info panel -------------------------------------------------------
+        with col2:
+            _render_structure_info(atoms, atomic_numbers, positions, xyz_string, title)
+
+        return True
+    except Exception as exc:
+        st.error(f"Error displaying structure: {exc}")
+    return False
+
+
+def trajectory_to_xyz_frames(traj, max_frames: int = 40) -> str:
+    """Serialize trajectory frames to multi-model XYZ text.
+
+    The format is what 3Dmol.js consumes via ``addModelsAsFrames`` --
+    both the Streamlit-side viewer and the combined IR explorer embed it.
+
+    Parameters
+    ----------
+    traj : Iterable[ase.Atoms]
+        Trajectory frames.
+    max_frames : int, optional
+        Downsample evenly to at most this many frames to bound the
+        payload size when many modes are embedded at once.
+
+    Returns
+    -------
+    str
+        Concatenated XYZ blocks, one per frame.
+    """
+    frames = list(traj)
+    if max_frames and len(frames) > max_frames:
+        step = -(-len(frames) // max_frames)  # ceil division
+        frames = frames[::step]
+    xyz_frames = []
+    for i, atoms in enumerate(frames):
+        symbols = atoms.get_chemical_symbols()
+        pos = atoms.get_positions()
+        lines = [str(len(symbols)), f"Frame {i}"]
+        lines += [
+            f"{s} {x:.6f} {y:.6f} {z:.6f}" for s, (x, y, z) in zip(symbols, pos)
+        ]
+        xyz_frames.append("\n".join(lines))
+    return "\n".join(xyz_frames)
+
+
+def visualize_trajectory(traj):
+    """Create an animated py3Dmol view from an ASE trajectory.
+
+    Parameters
+    ----------
+    traj : Iterable[ase.Atoms]
+        Trajectory frames to visualize.
+
+    Returns
+    -------
+    py3Dmol.view
+        Configured animated viewer.
+    """
+    xyz_str = trajectory_to_xyz_frames(traj)
+
+    view = py3Dmol.view(width="100%", height=VIEWER_HEIGHT)
+    view.addModelsAsFrames(xyz_str, "xyz")
+
+    view.setViewStyle({"style": "outline", "width": 0.05})
+    view.setStyle({"stick": {}, "sphere": {"scale": 0.25}})
+    view.zoomTo()
+    view.animate({"loop": "Forward", "interval": 100})
+
+    return view
+
+
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+
+
+def _render_structure_table(atomic_numbers, positions) -> None:
+    """Render a DataFrame table of atom positions.
+
+    Parameters
+    ----------
+    atomic_numbers : sequence
+        Atomic numbers for each atom.
+    positions : sequence
+        Cartesian coordinates for each atom.
+    """
+    data = []
+    for idx, (num, pos) in enumerate(zip(atomic_numbers, positions), 1):
+        sym = chemical_symbols[num] if num < len(chemical_symbols) else f"X{num}"
+        data.append(
+            {
+                "Atom": idx,
+                "Element": sym,
+                "X": f"{pos[0]:.4f}",
+                "Y": f"{pos[1]:.4f}",
+                "Z": f"{pos[2]:.4f}",
+            }
+        )
+    st.dataframe(pd.DataFrame(data), height=350, use_container_width=True)
+
+
+def _render_structure_info(atoms, atomic_numbers, positions, xyz_string, title) -> None:
+    """Render the info/download panel beside the 3-D viewer.
+
+    Parameters
+    ----------
+    atoms : ase.Atoms
+        Structure object.
+    atomic_numbers : sequence
+        Atomic numbers for each atom.
+    positions : sequence
+        Cartesian coordinates for each atom.
+    xyz_string : str
+        XYZ-format structure text.
+    title : str
+        Structure title used for download naming.
+    """
+    st.markdown("**Structure Information**")
+    st.write(f"- **Atoms:** {len(atoms)}")
+    st.write(f"- **Formula:** {atoms.get_chemical_formula()}")
+
+    # Composition
+    composition: dict[str, int] = {}
+    for atom in atoms:
+        composition[atom.symbol] = composition.get(atom.symbol, 0) + 1
+    st.write("**Composition:**")
+    for elem, count in sorted(composition.items()):
+        st.write(f"  \u2022 {elem}: {count}")
+
+    # Total mass
+    try:
+        total_mass = atoms.get_masses().sum()
+        st.write(f"**Total Mass:** {total_mass:.2f} amu")
+    except Exception:
+        st.write("**Total Mass:** Not available")
+
+    # Center of mass
+    try:
+        com = atoms.get_center_of_mass()
+        st.write("**Center of Mass:**")
+        st.write(f"  [{com[0]:.3f}, {com[1]:.3f}, {com[2]:.3f} ] \u00c5")
+    except Exception:
+        st.write("**Center of Mass:** Not available")
+
+    # Additional properties
+    with st.expander("\U0001f52c Additional Properties"):
+        try:
+            pos = atoms.positions
+            com = atoms.get_center_of_mass()
+            distances = np.linalg.norm(pos - com, axis=1)
+            st.write(f"**Max distance from COM:** {distances.max():.3f} \u00c5")
+            st.write(f"**Min distance from COM:** {distances.min():.3f} \u00c5")
+
+            cell = atoms.get_cell()
+            if np.any(cell.lengths()):
+                st.write(f"**Cell lengths:** {cell.lengths()}")
+                st.write(f"**Cell angles:** {cell.angles()}")
+            else:
+                st.write("**Cell:** non-periodic")
+        except Exception as prop_error:
+            st.write(f"Error calculating properties: {prop_error}")
+
+    # Downloads
+    st.write("**Download:**")
+    st.download_button(
+        "\U0001f4c4 XYZ File",
+        xyz_string,
+        f"{title.lower().replace(' ', '_')}.xyz",
+        mime="chemical/x-xyz",
+        key=_stable_key("xyz_download", title),
+    )
+
+    structure_json = json.dumps(
+        {
+            "atomic_numbers": atomic_numbers,
+            "positions": positions,
+            "formula": atoms.get_chemical_formula(),
+            "symbols": atoms.get_chemical_symbols(),
+        },
+        indent=2,
+    )
+    st.download_button(
+        "\U0001f4cb JSON Data",
+        structure_json,
+        f"{title.lower().replace(' ', '_')}.json",
+        mime="application/json",
+        key=_stable_key("json_download", title),
+    )

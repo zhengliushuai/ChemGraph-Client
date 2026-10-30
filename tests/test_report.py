@@ -1,0 +1,798 @@
+import json
+import re
+import pytest
+from pathlib import Path
+import tempfile
+import shutil
+from datetime import datetime
+from html.parser import HTMLParser
+from langchain_core.messages import AIMessage, ToolMessage
+from chemgraph.graphs.single_agent import route_after_report_tools, route_report_tools
+from chemgraph.schemas.ase_input import ASEOutputSchema
+from chemgraph.tools.report_tools import generate_html
+
+TEST_DIR = Path(__file__).parent
+
+# Sample ASE output data from the test file
+sample_ase_output = {
+    "input_structure_file": str(TEST_DIR / "water.xyz"),
+    "converged": True,
+    "final_structure": {
+        "numbers": [8, 1, 1],
+        "positions": [
+            [0.0, -1.497182414522372e-18, 0.39869538657185805],
+            [5.691224674128633e-20, 0.7641487689241104, -0.19934769828592902],
+            [-6.545249382012399e-22, -0.7641487689241104, -0.19934769828592905],
+        ],
+        "cell": [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]],
+        "pbc": [False, False, False],
+    },
+    "simulation_input": {
+        "input_structure_file": "water.xyz",
+        "output_results_file": "water_output.json",
+        "driver": "thermo",
+        "optimizer": "bfgs",
+        "calculator": {
+            "calculator_type": "emt",
+            "asap_cutoff": False,
+        },
+        "fmax": 0.01,
+        "steps": 1000,
+        "temperature": 298.0,
+        "pressure": 101325.0,
+    },
+    "potential_energy": -13.786080327355158,
+    "single_point_energy": -13.786080327355158,
+    "energy_unit": "eV",
+    "dipole_value": [None, None, None],
+    "dipole_unit": " e * angstrom",
+    "vibrational_frequencies": {
+        "energies": [
+            "6.9742290358871735i",
+            "3.2710270769584744i",
+            "0.04848856978180061i",
+            "0.005305115127349197i",
+            "0.04569285207959072",
+            "5.23408996896935",
+            "207.54494811634646",
+            "461.81541979826835",
+            "484.1391752707912",
+        ],
+        "energy_unit": "meV",
+        "frequencies": [
+            "56.250951188471966i",
+            "26.382612830086863i",
+            "0.3910866933047204i",
+            "0.042788639510142355i",
+            "0.3685377091525602",
+            "42.21578296978211",
+            "1673.962912005435",
+            "3724.792590476138",
+            "3904.84582259207",
+        ],
+        "frequency_unit": "cm-1",
+    },
+    "ir_data": {},
+    "thermochemistry": {
+        "enthalpy": -13.10654781092989,
+        "entropy": 0.001957587821789186,
+        "gibbs_free_energy": -13.689908981823066,
+        "unit": "eV",
+    },
+    "success": True,
+    "error": "",
+    "wall_time": 0.7555508613586426,
+}
+
+
+def create_xyz_content_from_final_structure(final_structure):
+    """Create XYZ file content from a final_structure dictionary."""
+    num_atoms = len(final_structure['numbers'])
+    xyz_lines = [str(num_atoms), "Sample molecule"]
+    element_map = {1: 'H', 8: 'O'}  # Simplified element map for this example
+
+    for num, pos in zip(final_structure['numbers'], final_structure['positions']):
+        element = element_map.get(num, f"X{num}")  # Use X{num} for unknown elements
+        x, y, z = pos
+        xyz_lines.append(f"{element} {x:.6f} {y:.6f} {z:.6f}")
+
+    return "\n".join(xyz_lines)
+
+
+@pytest.fixture
+def sample_ase_output_schema():
+    """Create a valid ASEOutputSchema object from the sample data."""
+    return ASEOutputSchema(**sample_ase_output)
+
+
+@pytest.fixture
+def ase_selected_output():
+    output = json.loads(json.dumps(sample_ase_output))
+    vibrations = output["vibrational_frequencies"]
+    vibrations["all_modes"] = [
+        {"mode_index": i, "frequency": frequency, "energy": energy}
+        for i, (frequency, energy) in enumerate(
+            zip(vibrations["frequencies"], vibrations["energies"])
+        )
+    ]
+    vibrations.update(
+        mode_indices=[6, 7, 8],
+        frequencies=vibrations["frequencies"][-3:],
+        energies=vibrations["energies"][-3:],
+    )
+    output["thermochemistry"].update(
+        ase_version="3.29.0",
+        vib_selection="highest",
+        ignore_imag_modes=False,
+        n_imag=0,
+        raw_imaginary_mode_count=4,
+        warnings=["ASE diagnostic: <input>"],
+    )
+    return output
+
+
+def test_generate_html_distinguishes_filtered_and_legacy_modes(tmp_path):
+    filtered_output = json.loads(json.dumps(sample_ase_output))
+    vibration_data = filtered_output["vibrational_frequencies"]
+    vibration_data["energies"] = vibration_data["energies"][-3:]
+    vibration_data["frequencies"] = vibration_data["frequencies"][-3:]
+
+    filtered_json = tmp_path / "filtered.json"
+    filtered_html = tmp_path / "filtered.html"
+    filtered_json.write_text(json.dumps(filtered_output), encoding="utf-8")
+    generate_html.invoke(
+        {
+            "results_json_path": str(filtered_json),
+            "output_path": str(filtered_html),
+        }
+    )
+    filtered_content = filtered_html.read_text(encoding="utf-8")
+    assert filtered_content.count("<td>Vibrational</td>") == 3
+    assert "<td>Translation/Rotation</td>" not in filtered_content
+    assert "6 translation/rotation modes are excluded" in filtered_content
+
+    legacy_json = tmp_path / "legacy.json"
+    legacy_html = tmp_path / "legacy.html"
+    legacy_json.write_text(json.dumps(sample_ase_output), encoding="utf-8")
+    generate_html.invoke(
+        {
+            "results_json_path": str(legacy_json),
+            "output_path": str(legacy_html),
+        }
+    )
+    legacy_content = legacy_html.read_text(encoding="utf-8")
+    assert legacy_content.count("<td>Translation/Rotation</td>") == 6
+    assert "This legacy result includes the first 6" in legacy_content
+
+
+@pytest.mark.parametrize("case", ["selection-only", "cleanup", "all-removed", "failure"])
+def test_report_shows_ase_retained_modes_and_complete_spectrum(tmp_path, case):
+    output = json.loads(json.dumps(sample_ase_output))
+    vibrations = output["vibrational_frequencies"]
+    all_modes = [
+        {"mode_index": i, "frequency": frequency, "energy": energy}
+        for i, (frequency, energy) in enumerate(
+            zip(
+                vibrations["frequencies"],
+                vibrations["energies"],
+            )
+        )
+    ]
+    indices = [6, 7, 8] if case == "selection-only" else [7, 8]
+    if case in {"all-removed", "failure"}:
+        indices = []
+    vibrations.update(
+        mode_indices=indices,
+        all_modes=all_modes,
+        energies=[all_modes[i]["energy"] for i in indices],
+        frequencies=[all_modes[i]["frequency"] for i in indices],
+    )
+    note = "ASE diagnostic: <input>"
+    # Cleanup cases retain coverage for older results that ignored imaginary modes.
+    output["thermochemistry"].update(
+        ase_version="3.29.0",
+        vib_selection="highest",
+        ignore_imag_modes=case != "selection-only",
+        n_imag=0 if case == "selection-only" else 1,
+        raw_imaginary_mode_count=4,
+        warnings=[] if case == "selection-only" else [note],
+    )
+    if case == "all-removed":
+        output["thermochemistry"]["warnings"].append(
+            "No vibrational modes contributed to thermochemistry."
+        )
+    if case == "failure":
+        output.update(
+            success=False,
+            error="Thermochemistry failed for <input>",
+            thermochemistry={},
+        )
+    results_json, report_html = tmp_path / "result.json", tmp_path / "report.html"
+    results_json.write_text(json.dumps(output), encoding="utf-8")
+    generate_html.invoke(
+        {"results_json_path": str(results_json), "output_path": str(report_html)}
+    )
+    content = report_html.read_text(encoding="utf-8")
+    assert f"{len(indices)} of 3 expected vibrational modes contributed" in content
+    assert "Complete input spectrum" in content
+    assert content.count("<td>Used</td>") == len(indices)
+    assert content.count("<td>Excluded</td>") == 9 - len(indices)
+    assert "<td>Translation/Rotation</td>" not in content
+    assert "Excluded modes are not necessarily translations or rotations" in content
+    for mode in all_modes:
+        assert mode["frequency"] in content
+    for i in indices:
+        assert re.search(rf'<tr class="vibrational-mode">\s*<td>{i + 1}</td>', content)
+    if case == "failure":
+        assert "Thermochemistry failed for &lt;input&gt;" in content
+        assert "Final Potential Energy" in content
+    else:
+        assert "ASE 3.29.0" in content
+        assert "Imaginary modes in the complete input: 4" in content
+    if case == "selection-only":
+        assert "ignore_imag_modes: False" in content
+        assert "Imaginary modes remaining after selection cause an error" in content
+        assert "zero-energy modes are not removed" in content
+        assert "ASE n_imag: 0" in content
+        assert "ASE cleanup" not in content
+        assert "<strong>Warning:</strong>" not in content
+    elif case != "failure":
+        assert "ignore_imag_modes: True" in content
+        assert (
+            "ASE cleanup removed 1 non-positive modes "
+            "(imaginary or zero energy) after selection" in content
+        )
+        assert "ASE diagnostic: &lt;input&gt;" in content
+    if case == "all-removed":
+        assert "No vibrational modes contributed to thermochemistry." in content
+
+
+@pytest.mark.parametrize(
+    ("field", "label"),
+    [
+        ("ase_version", "ASE 3.29.0"),
+        ("vib_selection", "mode selection:"),
+        ("ignore_imag_modes", "ignore_imag_modes:"),
+        ("raw_imaginary_mode_count", "Imaginary modes in the complete input:"),
+        ("n_imag", "ASE n_imag:"),
+        ("warnings", "ASE diagnostic:"),
+    ],
+)
+@pytest.mark.parametrize("missing", [True, False], ids=["missing", "null"])
+def test_report_tolerates_incomplete_metadata(
+    tmp_path, ase_selected_output, field, label, missing
+):
+    metadata = ase_selected_output["thermochemistry"]
+    if missing:
+        metadata.pop(field)
+    else:
+        metadata[field] = None
+    source, report = tmp_path / "result.json", tmp_path / "report.html"
+    source.write_text(json.dumps(ase_selected_output))
+    result = generate_html.invoke(
+        {"results_json_path": str(source), "output_path": str(report)}
+    )
+    assert result == str(report.resolve())
+    content = report.read_text()
+    assert label not in content
+    assert "Enthalpy:" in content
+    assert "Complete input spectrum" in content
+    if field != "warnings":
+        assert "ASE diagnostic: &lt;input&gt;" in content
+    if field == "ignore_imag_modes":
+        assert "ASE cleanup" not in content
+        assert "Imaginary modes remaining after selection cause an error" not in content
+        assert "ASE n_imag: 0" in content
+
+
+@pytest.mark.parametrize(
+    "indices",
+    [
+        "missing", None, [], [6, 7], [6, 7, 8, 8], [6, 7, 99], [6, 7, 7],
+        ["6", 7, 8], [True, 7, 8], [-1, 7, 8],
+    ],
+    ids=[
+        "missing", "null", "empty", "short", "long", "outside-spectrum", "duplicate",
+        "string-index", "boolean-index", "negative-index",
+    ],
+)
+def test_report_preserves_modes_without_valid_mapping(
+    tmp_path, ase_selected_output, indices
+):
+    vibrations = ase_selected_output["vibrational_frequencies"]
+    if indices == "missing":
+        vibrations.pop("mode_indices")
+    else:
+        vibrations["mode_indices"] = indices
+    source, report = tmp_path / "result.json", tmp_path / "report.html"
+    source.write_text(json.dumps(ase_selected_output))
+    result = generate_html.invoke(
+        {"results_json_path": str(source), "output_path": str(report)}
+    )
+    assert result == str(report.resolve())
+    content = report.read_text()
+    assert "Original mode mapping is unavailable or inconsistent" in content
+    assert "Complete input spectrum" in content
+    assert "3 of 3 expected vibrational modes contributed" in content
+    assert "<td>Used</td>" not in content
+    assert "<td>Excluded</td>" not in content
+    assert content.count("<td>Unknown</td>") == 12
+    selected_rows = re.findall(
+        r'<tr class="vibrational-mode">\s*<td>Unknown</td>\s*<td>(.*?)</td>\s*<td>(.*?)</td>',
+        content,
+    )
+    assert selected_rows == list(zip(vibrations["frequencies"], vibrations["energies"]))
+    for mode in vibrations["all_modes"]:
+        assert f"<td>{mode['frequency']}</td><td>{mode['energy']}</td>" in content
+
+
+@pytest.mark.parametrize("n_imag", [0, 2, None])
+def test_report_describes_legacy_cleanup_with_optional_count(
+    tmp_path, ase_selected_output, n_imag
+):
+    metadata = ase_selected_output["thermochemistry"]
+    metadata["ignore_imag_modes"] = True
+    if n_imag is None:
+        metadata.pop("n_imag")
+    else:
+        metadata["n_imag"] = n_imag
+    source, report = tmp_path / "result.json", tmp_path / "report.html"
+    source.write_text(json.dumps(ase_selected_output))
+    result = generate_html.invoke(
+        {"results_json_path": str(source), "output_path": str(report)}
+    )
+    assert result == str(report.resolve())
+    content = report.read_text()
+    assert "Imaginary modes in the complete input: 4" in content
+    assert "Imaginary modes remaining after selection cause an error" not in content
+    if n_imag is None:
+        assert "ASE cleanup removes non-positive modes" in content
+        assert "ASE cleanup removed" not in content
+    else:
+        assert f"ASE cleanup removed {n_imag} non-positive modes" in content
+
+
+@pytest.mark.parametrize("policy", [True, False, None])
+@pytest.mark.parametrize("field", ["raw_imaginary_mode_count", "n_imag"])
+@pytest.mark.parametrize(
+    "payload",
+    [
+        '<img id="thermo-count-payload" src=x onerror="window.reportProbe=1">',
+        '<script id="thermo-count-payload">window.reportProbe=1</script>',
+    ],
+    ids=["image-handler", "script"],
+)
+def test_report_renders_thermochemistry_counts_as_text(tmp_path, policy, field, payload):
+    class ReportParser(HTMLParser):
+        def __init__(self):
+            super().__init__()
+            self.element_ids = []
+            self.text_parts = []
+
+        def handle_starttag(self, tag, attrs):
+            self.element_ids.append(dict(attrs).get("id"))
+
+        def handle_data(self, data):
+            self.text_parts.append(data)
+
+    output = json.loads(json.dumps(sample_ase_output))
+    output["thermochemistry"].update(
+        ase_version="3.29.0",
+        vib_selection="highest",
+        ignore_imag_modes=policy,
+        n_imag=0,
+        raw_imaginary_mode_count=4,
+        warnings=[],
+    )
+    output["thermochemistry"][field] = payload
+    source, report = tmp_path / "result.json", tmp_path / "report.html"
+    source.write_text(json.dumps(output), encoding="utf-8")
+    result = generate_html.invoke(
+        {"results_json_path": str(source), "output_path": str(report)}
+    )
+    assert result == str(report.resolve())
+    parser = ReportParser()
+    parser.feed(report.read_text(encoding="utf-8"))
+    parser.close()
+    assert "thermo-count-payload" not in parser.element_ids
+    assert payload in "".join(parser.text_parts)
+
+
+@pytest.mark.parametrize(
+    ("driver", "legacy_energy", "expected_label"),
+    [
+        ("energy", False, "Single Point Energy"),
+        ("thermo", False, "Final Potential Energy"),
+        ("thermo", True, "Final Potential Energy"),
+    ],
+)
+def test_generate_html_labels_energy_by_driver(
+    tmp_path, driver, legacy_energy, expected_label
+):
+    output = json.loads(json.dumps(sample_ase_output))
+    output["simulation_input"]["driver"] = driver
+    if legacy_energy:
+        output.pop("potential_energy")
+
+    results_json = tmp_path / f"{driver}.json"
+    report_html = tmp_path / f"{driver}.html"
+    results_json.write_text(json.dumps(output), encoding="utf-8")
+
+    generate_html.invoke(
+        {
+            "results_json_path": str(results_json),
+            "output_path": str(report_html),
+        }
+    )
+
+    content = report_html.read_text(encoding="utf-8")
+    assert expected_label in content
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+@pytest.mark.parametrize("entropy_only", [False, True])
+def test_report_distinguishes_entropy_units(tmp_path, legacy, entropy_only):
+    output = json.loads(json.dumps(sample_ase_output))
+    if entropy_only:
+        output["thermochemistry"] = {"entropy": output["thermochemistry"]["entropy"]}
+    if not legacy:
+        output["thermochemistry"]["entropy_unit"] = "eV/K"
+    source, report = tmp_path / "result.json", tmp_path / "report.html"
+    source.write_text(json.dumps(output))
+    generate_html.invoke({"results_json_path": str(source), "output_path": str(report)})
+    content = report.read_text()
+    entropy_row = re.search(r'<div><strong>Entropy:</strong>.*?</div>', content).group()
+    assert 'class="entropy-unit">eV/K</span>' in entropy_row
+    assert 'class="entropy-value"' in entropy_row
+    assert 'data-ev-k="0.001957587821789186"' in entropy_row
+    assert 'class="energy-value"' not in entropy_row
+    assert '<span>Units:</span>' in content
+    assert 'Energy Unit:' not in content
+    if entropy_only:
+        assert '<strong>Enthalpy:</strong>' not in content
+        assert '<strong>Gibbs Free Energy:</strong>' not in content
+        return
+    for name in ("Enthalpy", "Gibbs Free Energy"):
+        row = re.search(rf'<div><strong>{name}:</strong>.*?</div>', content).group()
+        assert 'class="energy-unit">eV</span>' in row
+
+
+@pytest.mark.parametrize("unit", ["J/(mol K)", "kJ/(mol K)", "kcal/(mol K)", None, ""])
+def test_report_rejects_unsupported_entropy_units(tmp_path, unit):
+    output = json.loads(json.dumps(sample_ase_output))
+    output["thermochemistry"]["entropy_unit"] = unit
+    source, report = tmp_path / "result.json", tmp_path / "report.html"
+    source.write_text(json.dumps(output))
+    result = generate_html.invoke(
+        {"results_json_path": str(source), "output_path": str(report)}
+    )
+    assert result.startswith("Error:")
+    assert "Unsupported entropy_unit" in result
+    assert "expected 'eV/K'" in result
+    assert not report.exists()
+    report.write_text("previous report")
+    generate_html.invoke({"results_json_path": str(source), "output_path": str(report)})
+    assert report.read_text() == "previous report"
+
+
+@pytest.mark.parametrize(
+    ("case", "error"),
+    [
+        ("success", None),
+        ("missing-results", "Results JSON file not found"),
+        ("missing-xyz", "XYZ file not found"),
+        ("invalid-json", "Failed to parse JSON"),
+        ("invalid-schema", "Failed to validate results data"),
+        ("missing-structure", "Failed to validate results data"),
+        ("missing-output-directory", "Output directory does not exist"),
+        ("unsupported-entropy-unit", "Unsupported entropy_unit"),
+        ("write-error", "Failed to generate HTML report"),
+    ],
+)
+def test_report_result_controls_routing(tmp_path, ase_selected_output, case, error):
+    source, report = tmp_path / "result.json", tmp_path / "report.html"
+    args = {"results_json_path": str(source), "output_path": str(report)}
+    if case == "missing-results":
+        args["results_json_path"] = str(tmp_path / "missing.json")
+    elif case == "missing-xyz":
+        args["xyz_path"] = str(tmp_path / "missing.xyz")
+    elif case == "missing-structure":
+        ase_selected_output["final_structure"] = None
+    elif case == "missing-output-directory":
+        args["output_path"] = str(tmp_path / "missing" / "report.html")
+    elif case == "unsupported-entropy-unit":
+        ase_selected_output["thermochemistry"]["entropy_unit"] = "J/(mol K)"
+    source.write_text(json.dumps(ase_selected_output))
+    if case == "invalid-json":
+        source.write_text("{")
+    elif case == "invalid-schema":
+        source.write_text("{}")
+    if case == "write-error":
+        report.mkdir()
+    else:
+        report.write_text("previous report")
+
+    result = generate_html.invoke(args)
+    if error is None:
+        assert result == str(report.resolve())
+        assert "Calculation Results" in report.read_text()
+    else:
+        assert result.startswith("Error:")
+        assert error in result
+        if report.is_file():
+            assert report.read_text() == "previous report"
+    messages = [ToolMessage(content=result, name="generate_html", tool_call_id="call_1")]
+    assert route_after_report_tools({"messages": messages}) == ("retry" if error else "done")
+    messages.append(
+        AIMessage(content="", tool_calls=[{
+            "name": "generate_html", "args": args, "id": "call_2", "type": "tool_call",
+        }])
+    )
+    assert route_report_tools({"messages": messages}) == ("tools" if error else "done")
+
+
+@pytest.mark.parametrize("script_tag", ["script", "SCRIPT", "ScRiPt"])
+def test_report_unit_conversion_javascript(tmp_path, script_tag):
+    """Execute the generated converter, with only its DOM dependencies stubbed."""
+    quickjs = pytest.importorskip("quickjs")
+
+    class ScriptParser(HTMLParser):
+        def __init__(self):
+            super().__init__()
+            self.scripts = []
+            self.parts = None
+
+        def handle_starttag(self, tag, attrs):
+            if tag == "script":
+                self.parts = []
+
+        def handle_data(self, data):
+            if self.parts is not None:
+                self.parts.append(data)
+
+        def handle_endtag(self, tag):
+            if tag == "script" and self.parts is not None:
+                self.scripts.append("".join(self.parts))
+                self.parts = None
+
+    source, report = tmp_path / "result.json", tmp_path / "report.html"
+    source.write_text(json.dumps(sample_ase_output))
+    generate_html.invoke({"results_json_path": str(source), "output_path": str(report)})
+    content = report.read_text()
+    content = content.replace("<script>", f'<{script_tag} type="text/javascript">')
+    content = content.replace("</script>", f"</{script_tag}>")
+    elements = {}
+    for kind, attrs, value in re.findall(
+        r'<span class="((?:energy|entropy)-(?:value|unit))"([^>]*)>(.*?)</span>',
+        content,
+    ):
+        dataset = {}
+        for attr, key in [("data-ev", "ev"), ("data-ev-k", "evK")]:
+            match = re.search(rf'{attr}="([^"]*)"', attrs)
+            if match:
+                dataset[key] = match.group(1)
+        elements.setdefault(f".{kind}", []).append(
+            {"dataset": dataset, "textContent": value}
+        )
+    runtime = quickjs.Context()
+    runtime.eval("const elements = " + json.dumps(elements))
+    runtime.eval("""
+        Object.values(elements).flat().forEach(cell => {
+            cell.parentElement = {querySelector: () => ({textContent: ''})};
+        });
+        const document = {
+            querySelectorAll: selector => elements[selector] || [],
+            addEventListener: () => {},
+        };
+    """)
+    parser = ScriptParser()
+    parser.feed(content)
+    parser.close()
+    script = next(
+        script for script in parser.scripts if 'function toggleEnergyUnit' in script
+    )
+    runtime.eval(script)
+    thermo = sample_ase_output["thermochemistry"]
+    energy_values = [
+        round(sample_ase_output["potential_energy"], 6),
+        thermo["enthalpy"],
+        thermo["gibbs_free_energy"],
+    ]
+    conversions = {
+        "ev": (1, "eV", "eV/K", 6, 6),
+        "kjmol": (96.485, "kJ/mol", "kJ/(mol K)", 2, 4),
+        "kcalmol": (23.061, "kcal/mol", "kcal/(mol K)", 2, 4),
+    }
+    for unit in ["ev", "kjmol", "kcalmol", "ev", "kcalmol", "kjmol", "ev"]:
+        runtime.eval(f"toggleEnergyUnit('{unit}')")
+        actual = json.loads(runtime.eval("JSON.stringify(elements)"))
+        factor, energy_unit, entropy_unit, energy_digits, entropy_digits = conversions[
+            unit
+        ]
+        assert [cell["textContent"] for cell in actual[".energy-value"]] == [
+            f"{value * factor:.{energy_digits}f}" for value in energy_values
+        ]
+        assert (
+            actual[".entropy-value"][0]["textContent"]
+            == f"{thermo['entropy'] * factor:.{entropy_digits}f}"
+        )
+        assert all(
+            cell["textContent"] == energy_unit for cell in actual[".energy-unit"]
+        )
+        assert all(
+            cell["textContent"] == entropy_unit for cell in actual[".entropy-unit"]
+        )
+
+
+@pytest.fixture(scope="session")
+def test_output_dir():
+    """Create a test output directory for saving HTML files for inspection."""
+    # Create a test_outputs directory in the tests folder
+    output_dir = Path(__file__).parent / "test_outputs"
+    output_dir.mkdir(exist_ok=True)
+
+    # Create a timestamped subdirectory for this test run
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_dir = output_dir / f"run_{timestamp}"
+    run_dir.mkdir(exist_ok=True)
+
+    yield run_dir
+
+    # Optionally clean up old test outputs (keep last 5 runs)
+    if output_dir.exists():
+        runs = sorted(output_dir.glob("run_*"), key=lambda x: x.stat().st_mtime, reverse=True)
+        for old_run in runs[5:]:  # Keep only the 5 most recent runs
+            shutil.rmtree(old_run)
+
+
+def test_generate_html_with_xyz(test_output_dir, sample_ase_output_schema):
+    """Test the generate_html function with an external XYZ file."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # Write sample ASE output to a JSON file (use model_dump to get
+        # a clean serializable dict, matching what run_ase writes to disk)
+        json_path = Path(tmpdir) / "results.json"
+        with open(json_path, "w") as f:
+            json.dump(sample_ase_output_schema.model_dump(), f, default=str)
+
+        # Create input XYZ file
+        xyz_path = Path(tmpdir) / "molecule.xyz"
+        xyz_content = create_xyz_content_from_final_structure(sample_ase_output['final_structure'])
+        with open(xyz_path, "w") as f:
+            f.write(xyz_content)
+
+        # Create output HTML file path
+        output_path = Path(tmpdir) / "report.html"
+
+        # Generate HTML report with xyz_path
+        result = generate_html.invoke({
+            "results_json_path": str(json_path),
+            "output_path": str(output_path),
+            "xyz_path": str(xyz_path),
+        })
+
+        # Verify the returned path matches our output path
+        assert result == str(output_path)
+
+        # Verify the HTML file was created
+        assert output_path.exists()
+
+        # Save a copy of the HTML file for inspection
+        inspection_path = test_output_dir / "report_with_xyz.html"
+        shutil.copy2(output_path, inspection_path)
+        print(f"\nSaved HTML report with XYZ file to: {inspection_path}")
+
+        # Read the generated HTML content
+        with open(output_path, "r") as f:
+            html_content = f.read()
+
+        # Verify key information is present in the HTML
+        assert "XYZ Molecule Viewer" in html_content
+        assert "Calculation Results" in html_content
+        assert "Simulation Details" in html_content
+
+        # Check for collapsible functionality
+        assert "toggleSection" in html_content
+        assert "collapsible-content" in html_content
+        assert "onclick=\"toggleSection" in html_content
+
+        # Check for simulation details
+        assert "Simulation Type" in html_content
+        assert "Calculator" in html_content
+        assert "thermo" in html_content  # From sample data
+        assert "Temperature" in html_content
+        assert "Pressure" in html_content
+
+        # Check for thermochemistry values
+        assert "Enthalpy" in html_content
+        assert "Entropy" in html_content
+        assert "Gibbs Free Energy" in html_content
+        assert "Thermochemistry Values" in html_content
+        assert "<span>Units:</span>" in html_content
+        assert "eV" in html_content
+        assert "kJ/mol" in html_content
+        assert "kcal/mol" in html_content
+
+        # Check for vibrational frequencies
+        assert "Vibrational Frequencies" in html_content  # Check for the label
+        assert "cm-1" in html_content  # Check for unit
+
+        # Verify the NGL viewer is included
+        assert "ngl.js" in html_content
+        assert "new NGL.Stage" in html_content
+
+        # Verify the XYZ content is properly encoded
+        assert "const xyzData = atob(" in html_content
+        assert "stage.loadFile" in html_content
+
+
+def test_generate_html_without_xyz(test_output_dir, sample_ase_output_schema):
+    """Test the generate_html function using only the final_structure from ASE output."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        # Write sample ASE output to a JSON file (use model_dump to get
+        # a clean serializable dict, matching what run_ase writes to disk)
+        json_path = Path(tmpdir) / "results.json"
+        with open(json_path, "w") as f:
+            json.dump(sample_ase_output_schema.model_dump(), f, default=str)
+
+        # Create output HTML file path
+        output_path = Path(tmpdir) / "report.html"
+
+        # Generate HTML report without xyz_path
+        result = generate_html.invoke({
+            "results_json_path": str(json_path),
+            "output_path": str(output_path),
+        })
+
+        # Verify the returned path matches our output path
+        assert result == str(output_path)
+
+        # Verify the HTML file was created
+        assert output_path.exists()
+
+        # Save a copy of the HTML file for inspection
+        inspection_path = test_output_dir / "report_without_xyz.html"
+        shutil.copy2(output_path, inspection_path)
+        print(f"\nSaved HTML report without XYZ file to: {inspection_path}")
+
+        # Read the generated HTML content
+        with open(output_path, "r") as f:
+            html_content = f.read()
+
+        # Verify key information is present in the HTML
+        assert "XYZ Molecule Viewer" in html_content
+        assert "Calculation Results" in html_content
+        assert "Simulation Details" in html_content
+
+        # Check for collapsible functionality
+        assert "toggleSection" in html_content
+        assert "collapsible-content" in html_content
+        assert "onclick=\"toggleSection" in html_content
+
+        # Check for simulation details
+        assert "Simulation Type" in html_content
+        assert "Calculator" in html_content
+        assert "thermo" in html_content  # From sample data
+        assert "Temperature" in html_content
+        assert "Pressure" in html_content
+
+        # Check for thermochemistry values
+        assert "Enthalpy" in html_content
+        assert "Entropy" in html_content
+        assert "Gibbs Free Energy" in html_content
+        assert "Thermochemistry Values" in html_content
+        assert "<span>Units:</span>" in html_content
+        assert "eV" in html_content
+        assert "kJ/mol" in html_content
+        assert "kcal/mol" in html_content
+
+        # Check for vibrational frequencies
+        assert "Vibrational Frequencies" in html_content  # Check for the label
+        assert "cm-1" in html_content  # Check for unit
+
+        # Verify the NGL viewer is included
+        assert "ngl.js" in html_content
+        assert "new NGL.Stage" in html_content
+
+        # Verify the XYZ content is properly encoded
+        assert "const xyzData = atob(" in html_content
+        assert "stage.loadFile" in html_content

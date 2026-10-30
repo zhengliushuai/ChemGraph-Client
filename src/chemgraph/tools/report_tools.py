@@ -1,0 +1,946 @@
+import os
+import json
+import base64
+from html import escape
+from typing import Optional
+from langchain_core.tools import tool
+
+from ase.data import chemical_symbols as _chemical_symbols
+
+from chemgraph.schemas.ase_input import ASEOutputSchema
+from chemgraph.tools.ase_core import _resolve_existing_path, _resolve_path
+from chemgraph.tools.ase_tools import is_linear_molecule
+
+
+HTML_TEMPLATE = """<!DOCTYPE html>
+<html>
+<head>
+    <title>XYZ Molecule Viewer</title>
+    <script src="https://unpkg.com/ngl@2.0.0-dev.37/dist/ngl.js"></script>
+    <style>
+        body {{
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            margin: 0;
+            padding: 0;
+            background-color: #f5f5f5;
+            color: #333;
+        }}
+        .container {{
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+        }}
+        h1 {{
+            color: #2c3e50;
+            margin-bottom: 1.5rem;
+            font-weight: 600;
+        }}
+        h2 {{
+            color: #2c3e50;
+            margin-top: 2rem;
+            margin-bottom: 1rem;
+            font-weight: 500;
+            display: flex;
+            align-items: center;
+            cursor: pointer;
+        }}
+        h2::before {{
+            content: '▼';
+            font-size: 0.8em;
+            margin-right: 0.5rem;
+            transition: transform 0.3s ease;
+        }}
+        h2.collapsed::before {{
+            transform: rotate(-90deg);
+        }}
+        #viewer {{
+            width: 100%;
+            height: 600px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            background: white;
+            margin: 1rem 0;
+        }}
+        .info-section {{
+            background: white;
+            padding: 1.5rem;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            margin-top: 2rem;
+        }}
+        .info-section ul {{
+            list-style-type: none;
+            padding: 0;
+            margin: 0;
+            display: flex;
+            flex-direction: column;
+            gap: 1rem;
+        }}
+        .info-section li {{
+            padding: 0;
+            border: none;
+            margin: 0;
+        }}
+        .sub-section {{
+            border: 1px solid #eee;
+            border-radius: 4px;
+            padding: 0.5rem;
+            background: #fafafa;
+        }}
+        .sub-section h3 {{
+            color: #2c3e50;
+            margin: 0;
+            padding: 0.5rem;
+            font-size: 1.1em;
+            font-weight: 500;
+            display: flex;
+            align-items: center;
+            cursor: pointer;
+            user-select: none;
+            background: #f8f9fa;
+            border-radius: 4px;
+        }}
+        .sub-section h3::before {{
+            content: '▼';
+            font-size: 0.8em;
+            margin-right: 0.5rem;
+            transition: transform 0.3s ease;
+            display: inline-block;
+        }}
+        .sub-section h3.collapsed::before {{
+            transform: rotate(-90deg);
+        }}
+        .sub-section-content {{
+            display: block;
+            padding: 0.5rem;
+            margin-top: 0.5rem;
+        }}
+        .sub-section-content.collapsed {{
+            display: none;
+        }}
+        .table-container {{
+            max-height: 300px;
+            overflow-y: auto;
+            border: 1px solid #eee;
+            border-radius: 4px;
+            margin: 0.5rem 0;
+        }}
+        .table-container table {{
+            margin: 0;
+            border-collapse: collapse;
+            width: 100%;
+        }}
+        .table-container thead {{
+            position: sticky;
+            top: 0;
+            background: #f8f9fa;
+            z-index: 1;
+        }}
+        .table-container th {{
+            border-bottom: 2px solid #dee2e6;
+        }}
+        .table-container tbody tr:last-child td {{
+            border-bottom: none;
+        }}
+        .unit-toggle {{
+            display: inline-flex;
+            align-items: center;
+            gap: 0.5rem;
+            margin: 0.5rem 0;
+            padding: 0.5rem;
+            background: #f8f9fa;
+            border: 1px solid #dee2e6;
+            border-radius: 4px;
+            font-size: 0.9em;
+        }}
+        .unit-toggle button {{
+            padding: 0.25rem 0.5rem;
+            background: #fff;
+            border: 1px solid #dee2e6;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 0.9em;
+        }}
+        .unit-toggle button.active {{
+            background: #2c3e50;
+            color: white;
+            border-color: #2c3e50;
+        }}
+        .unit-toggle button:hover:not(.active) {{
+            background: #e9ecef;
+        }}
+        .energy-value, .entropy-value {{
+            display: inline-block;
+            min-width: 100px;
+        }}
+        .regular-item {{
+            padding: 0.5rem;
+            background: #f8f9fa;
+            border-radius: 4px;
+            border: 1px solid #eee;
+        }}
+        table {{
+            width: 100%;
+            border-collapse: collapse;
+            margin: 0.5rem 0;
+            font-size: 0.9em;
+        }}
+        th, td {{
+            padding: 0.5rem;
+            text-align: left;
+            border-bottom: 1px solid #eee;
+        }}
+        th {{
+            background-color: #f8f9fa;
+            font-weight: 600;
+            color: #2c3e50;
+        }}
+        tr:hover {{
+            background-color: #f8f9fa;
+        }}
+        pre {{
+            background: #f8f9fa;
+            padding: 1rem;
+            border-radius: 4px;
+            overflow-x: auto;
+            margin: 0.5rem 0;
+        }}
+        code {{
+            font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace;
+            font-size: 0.9em;
+        }}
+        .collapsible-content {{
+            transition: max-height 0.3s ease-out;
+            max-height: 2000px;
+            overflow: hidden;
+        }}
+        .collapsible-content.collapsed {{
+            max-height: 0;
+        }}
+        .vibrational-mode {{
+            background-color: #e8f5e9;
+        }}
+        .trans-rot-mode {{
+            background-color: #fff3e0;
+        }}
+        .mode-explanation {{
+            background-color: #f5f5f5;
+            padding: 10px;
+            border-radius: 4px;
+            margin-bottom: 15px;
+            border: 1px solid #e0e0e0;
+        }}
+        .mode-explanation p {{
+            margin: 5px 0;
+        }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>XYZ Molecule Viewer</h1>
+        <div id="viewer"></div>
+        <div class="info-section">
+            <h2 onclick="toggleSection('calculation-results')">Calculation Results</h2>
+            <div id="calculation-results" class="collapsible-content">
+                <ul>
+                    <!-- Results will be populated here -->
+                </ul>
+            </div>
+        </div>
+        <div class="info-section">
+            <h2 onclick="toggleSection('simulation-details')">Simulation Details</h2>
+            <div id="simulation-details" class="collapsible-content">
+                <ul>
+                    <!-- Simulation details will be populated here -->
+                </ul>
+            </div>
+        </div>
+    </div>
+    <script>
+        function toggleSection(sectionId) {{
+            const content = document.getElementById(sectionId);
+            const header = content.previousElementSibling;
+            content.classList.toggle('collapsed');
+            header.classList.toggle('collapsed');
+        }}
+
+        function toggleSubSection(sectionId) {{
+            const content = document.getElementById(sectionId);
+            const header = content.previousElementSibling;
+            if (content.style.display === 'none') {{
+                content.style.display = 'block';
+                header.classList.remove('collapsed');
+            }} else {{
+                content.style.display = 'none';
+                header.classList.add('collapsed');
+            }}
+        }}
+
+        // Initialize all sub-sections as expanded
+        document.addEventListener('DOMContentLoaded', function() {{
+            const subSections = document.querySelectorAll('.sub-section-content');
+            subSections.forEach(section => {{
+                section.style.display = 'block';
+            }});
+        }});
+
+        const stage = new NGL.Stage("viewer", {{ backgroundColor: "white" }});
+
+        function xyzToPDB(xyzContent) {{
+            const lines = xyzContent.trim().split("\\n");
+            const numAtoms = parseInt(lines[0]);
+            let pdbContent = '';
+            for (let i = 2; i < lines.length && i < numAtoms + 2; i++) {{
+                const parts = lines[i].trim().split(/\\s+/);
+                if (parts.length >= 4) {{
+                    const [atom, x, y, z] = parts;
+                    const atomName = atom.padEnd(3);
+                    const serial = String(i - 1).padStart(5);
+                    const xStr = parseFloat(x).toFixed(3).padStart(8);
+                    const yStr = parseFloat(y).toFixed(3).padStart(8);
+                    const zStr = parseFloat(z).toFixed(3).padStart(8);
+                    pdbContent += `HETATM${{serial}} ${{atomName}} MOL     1    ${{xStr}}${{yStr}}${{zStr}}  1.00  0.00\\n`;
+                }}
+            }}
+            pdbContent += 'END\\n';
+            return pdbContent;
+        }}
+
+        const xyzData = atob("{encoded_xyz}");
+
+        const pdbContent = xyzToPDB(xyzData);
+        stage.loadFile(new Blob([pdbContent], {{ type: 'text/plain' }}), {{ ext: 'pdb' }}).then(component => {{
+            component.addRepresentation("ball+stick");
+            component.autoView();
+        }});
+    </script>
+</body>
+</html>
+"""
+
+
+@tool
+def generate_html(
+    results_json_path: str,
+    output_path: str = "report.html",
+    xyz_path: Optional[str] = None,
+) -> str:
+    """Generate an HTML report from the JSON results file produced by run_ase.
+
+    Parameters
+    ----------
+    results_json_path : str
+        Path to the JSON file produced by the run_ase tool containing
+        the full simulation results (energy, structure, frequencies, etc.).
+    output_path : str
+        Path where the HTML report will be saved. Defaults to "report.html".
+    xyz_path : Optional[str]
+        Optional path to an XYZ file for the 3D viewer. If not provided,
+        the final_structure from the results JSON will be used.
+
+    Returns
+    -------
+    str
+        Absolute path to the generated HTML file, or an ``Error:`` message.
+    """
+    # run_ase and the coordinate writers emit relative paths into
+    # CHEMGRAPH_LOG_DIR via _resolve_path; resolve bare names to match so a
+    # report can be built from files produced earlier in the same session.
+    results_json_path = _resolve_existing_path(results_json_path)
+    if xyz_path is not None:
+        xyz_path = _resolve_existing_path(xyz_path)
+    # The report is a run artifact too: a bare "report.html" must land in
+    # the session log dir, not whatever directory the server started in.
+    output_path = _resolve_path(output_path)
+
+    # Validate results_json_path exists
+    if not os.path.isfile(results_json_path):
+        return (
+            f"Error: Results JSON file not found: {results_json_path}. "
+            "Please provide a valid path to the JSON file produced by the run_ase tool."
+        )
+
+    # Validate xyz_path exists (if provided)
+    if xyz_path is not None and not os.path.isfile(xyz_path):
+        return (
+            f"Error: XYZ file not found: {xyz_path}. "
+            "Please provide a valid path to an XYZ file."
+        )
+
+    # Load and parse the results JSON
+    try:
+        with open(results_json_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except json.JSONDecodeError as e:
+        return (
+            f"Error: Failed to parse JSON from {results_json_path}: {e}. "
+            "The file may be corrupted or not valid JSON."
+        )
+
+    # Validate the data against ASEOutputSchema
+    try:
+        ase_output = ASEOutputSchema(**data)
+    except Exception as e:
+        return (
+            f"Error: Failed to validate results data from {results_json_path}: {e}. "
+            "The JSON file may not contain valid ASE output data."
+        )
+
+    # Get XYZ content either from file or final_structure
+    if xyz_path is not None:
+        with open(xyz_path, 'r') as f:
+            xyz_content = f.read()
+    else:
+        if ase_output.final_structure is None:
+            return (
+                "Error: No XYZ file provided and no final_structure found in the results JSON. "
+                "Please provide an xyz_path or ensure the simulation results include a final structure."
+            )
+
+        # Convert final_structure to XYZ format
+        num_atoms = len(ase_output.final_structure.numbers)
+        xyz_lines = [str(num_atoms), "Optimized Structure"]
+
+        for num, pos in zip(
+            ase_output.final_structure.numbers, ase_output.final_structure.positions
+        ):
+            element = _chemical_symbols[num] if num < len(_chemical_symbols) else f"X{num}"
+            x, y, z = pos
+            xyz_lines.append(f"{element} {x:.6f} {y:.6f} {z:.6f}")
+
+        xyz_content = "\n".join(xyz_lines)
+
+    # Validate output directory exists
+    output_dir = os.path.dirname(os.path.abspath(output_path))
+    if not os.path.isdir(output_dir):
+        return (
+            f"Error: Output directory does not exist: {output_dir}. "
+            "Please provide a valid output path."
+        )
+
+    # Generate the HTML report
+    try:
+        encoded_xyz = base64.b64encode(xyz_content.encode()).decode()
+        html_content = HTML_TEMPLATE.format(encoded_xyz=encoded_xyz)
+
+        # Add additional information to the HTML content
+        html_content = add_additional_info_to_html(html_content, ase_output)
+
+        with open(output_path, 'w', encoding='utf-8') as f:
+            f.write(html_content)
+        print(f"✅ HTML viewer created: {output_path}")
+        return str(os.path.abspath(output_path))
+    except Exception as e:
+        return f"Error: Failed to generate HTML report: {e}"
+
+
+def add_additional_info_to_html(html_content: str, ase_output: ASEOutputSchema) -> str:
+    """Add ASE calculation results to the HTML content.
+
+    Parameters
+    ----------
+    html_content : str
+        The base HTML content
+    ase_output : ASEOutputSchema
+        The output from an ASE calculation
+
+    Returns
+    -------
+    str
+        HTML content with additional information added
+    """
+    # Calculation Results section
+    calc_results = []
+
+    # Optimized Coordinates (from final structure)
+    if ase_output.final_structure is not None:
+        # Convert AtomsData to XYZ format
+        num_atoms = len(ase_output.final_structure.numbers)
+        xyz_lines = [str(num_atoms), "Optimized Structure"]
+
+        for num, pos in zip(
+            ase_output.final_structure.numbers, ase_output.final_structure.positions
+        ):
+            element = _chemical_symbols[num] if num < len(_chemical_symbols) else f"X{num}"
+            x, y, z = pos
+            xyz_lines.append(f"{element} {x:.6f} {y:.6f} {z:.6f}")
+
+        xyz_str = "\n".join(xyz_lines)
+        calc_results.append(f"""
+        <li>
+            <div class="sub-section">
+                <h3 onclick="toggleSubSection('optimized-coords')">Optimized Coordinates</h3>
+                <div id="optimized-coords" class="sub-section-content">
+                    <pre><code>{xyz_str}</code></pre>
+                </div>
+            </div>
+        </li>""")
+    else:
+        calc_results.append(
+            "<li class='regular-item'><strong>Optimized Coordinates:</strong> N/A</li>"
+        )
+
+    # Energy
+    energy_ev = ase_output.potential_energy
+    if energy_ev is None:
+        energy_ev = ase_output.single_point_energy
+    driver = ase_output.simulation_input.driver
+    energy_label = (
+        "Single Point Energy"
+        if driver in {"energy", "dipole"}
+        else "Final Potential Energy"
+    )
+    if energy_ev is not None:
+        calc_results.append(f"""
+        <li class='regular-item'>
+            <div class="unit-toggle">
+                <span>Units:</span>
+                <button onclick="toggleEnergyUnit('ev')" class="active" data-unit="ev">eV</button>
+                <button onclick="toggleEnergyUnit('kjmol')" data-unit="kjmol">kJ/mol</button>
+                <button onclick="toggleEnergyUnit('kcalmol')" data-unit="kcalmol">kcal/mol</button>
+            </div>
+            <div>
+                <strong>{energy_label}</strong> (<span class="energy-unit">eV</span>):
+                <span class="energy-value" data-ev="{energy_ev:.6f}"></span>
+            </div>
+        </li>""")
+    else:
+        calc_results.append(
+            f"<li class='regular-item'><strong>{energy_label}</strong> ({ase_output.energy_unit}): N/A</li>"
+        )
+
+    # Vibrational Frequencies
+    if (
+        ase_output.vibrational_frequencies
+        and "frequencies" in ase_output.vibrational_frequencies
+    ):
+        freq_unit = ase_output.vibrational_frequencies.get("frequency_unit", "cm-1")
+        energy_unit = ase_output.vibrational_frequencies.get("energy_unit", "meV")
+
+        num_atoms = len(ase_output.final_structure.numbers)
+        if num_atoms == 1:
+            molecule_type = "Monatomic"
+            trans_rot_modes = 3
+        else:
+            is_linear = is_linear_molecule.invoke(
+                {"atomsdata": ase_output.final_structure}
+            )
+            molecule_type = "Linear" if is_linear else "Non-linear"
+            trans_rot_modes = 5 if is_linear else 6
+
+        frequencies = ase_output.vibrational_frequencies["frequencies"]
+        ase_selected = "all_modes" in ase_output.vibrational_frequencies
+        selected_indices = ase_output.vibrational_frequencies.get("mode_indices")
+        has_mode_mapping = (
+            ase_selected
+            and isinstance(selected_indices, list)
+            and len(selected_indices) == len(frequencies)
+            and all(type(index) is int and index >= 0 for index in selected_indices)
+            and len(set(selected_indices)) == len(selected_indices)
+            and set(selected_indices).issubset(
+                mode["mode_index"]
+                for mode in ase_output.vibrational_frequencies["all_modes"]
+            )
+        )
+        includes_nonvibrational_modes = len(frequencies) == 3 * num_atoms
+        num_vibrational_modes = max(3 * num_atoms - trans_rot_modes, 0)
+
+        # Create table header
+        freq_table = f"""
+        <div class="table-container">
+            <table>
+                <thead>
+                    <tr>
+                        <th style="width: 80px;">Mode #</th>
+                        <th>Frequency ({freq_unit})</th>
+                        <th>Energy ({energy_unit})</th>
+                        <th>Type</th>
+                    </tr>
+                </thead>
+                <tbody>
+        """
+
+        # Add table rows with mode numbers and highlighting
+        for i, (freq, energy) in enumerate(
+            zip(
+                ase_output.vibrational_frequencies["frequencies"],
+                ase_output.vibrational_frequencies["energies"],
+            ),
+            1,
+        ):
+            is_nonvibrational = (
+                not ase_selected and includes_nonvibrational_modes and i <= trans_rot_modes
+            )
+            mode_type = (
+                "Translation/Rotation" if is_nonvibrational else "Vibrational"
+            )
+            row_class = (
+                "trans-rot-mode" if is_nonvibrational else "vibrational-mode"
+            )
+            display_index = i
+            if ase_selected:
+                display_index = selected_indices[i - 1] + 1 if has_mode_mapping else "Unknown"
+
+            freq_table += f"""
+                    <tr class="{row_class}">
+                        <td>{display_index}</td>
+                        <td>{freq}</td>
+                        <td>{energy}</td>
+                        <td>{mode_type}</td>
+                    </tr>
+            """
+
+        freq_table += """
+                </tbody>
+            </table>
+        </div>
+        """
+
+        if ase_selected:
+            mode_note = (
+                f"{len(frequencies)} of {num_vibrational_modes} expected vibrational "
+                "modes contributed to thermochemistry. "
+            )
+            if has_mode_mapping:
+                mode_note += (
+                    "Mode numbers refer to the original ASE spectrum (displayed starting at 1). "
+                    "Excluded modes are not necessarily translations or rotations."
+                )
+            else:
+                mode_note += (
+                    "Original mode mapping is unavailable or inconsistent. Selected mode "
+                    "numbers and usage in the complete spectrum are shown as Unknown."
+                )
+            raw_rows = []
+            for mode in ase_output.vibrational_frequencies["all_modes"]:
+                disposition = "Unknown"
+                if has_mode_mapping:
+                    disposition = (
+                        "Used" if mode["mode_index"] in selected_indices else "Excluded"
+                    )
+                raw_rows.append(
+                    f"<tr><td>{mode['mode_index'] + 1}</td>"
+                    f"<td>{escape(str(mode['frequency']))}</td>"
+                    f"<td>{escape(str(mode['energy']))}</td>"
+                    f"<td>{disposition}</td></tr>"
+                )
+            freq_table += (
+                "<details><summary>Complete input spectrum</summary>"
+                "<div class='table-container'><table><thead><tr>"
+                f"<th>Mode #</th><th>Frequency ({escape(freq_unit)})</th>"
+                f"<th>Energy ({escape(energy_unit)})</th><th>Thermochemistry</th>"
+                "</tr></thead><tbody>" + "".join(raw_rows)
+                + "</tbody></table></div></details>"
+            )
+        elif includes_nonvibrational_modes:
+            mode_note = (
+                f"This legacy result includes the first {trans_rot_modes} "
+                "translation/rotation modes."
+            )
+        else:
+            mode_note = (
+                f"The {trans_rot_modes} translation/rotation modes are excluded "
+                "from the reported frequencies."
+            )
+
+        breakdown = (
+            f"Expected: {num_vibrational_modes} vibrational modes; "
+            f"used: {len(frequencies)}"
+            if ase_selected else
+            f"{trans_rot_modes} translation/rotation modes + {num_vibrational_modes} vibrational modes"
+        )
+        mode_explanation = f"""
+        <div class="mode-explanation">
+            <p><strong>Molecule Type:</strong> {molecule_type}</p>
+            <p><strong>Mode Breakdown:</strong> {breakdown}</p>
+            <p><em>Note: {mode_note}</em></p>
+        </div>
+        """
+
+        calc_results.append(f"""
+        <li>
+            <div class="sub-section">
+                <h3 onclick="toggleSubSection('vib-freqs')">Vibrational Frequencies</h3>
+                <div id="vib-freqs" class="sub-section-content">
+                    {mode_explanation}
+                    {freq_table}
+                </div>
+            </div>
+        </li>""")
+    else:
+        calc_results.append(
+            "<li class='regular-item'><strong>Vibrational Frequencies:</strong> N/A</li>"
+        )
+
+    # Thermochemistry Values
+    if ase_output.thermochemistry:
+        thermo_info = []
+        metadata = ase_output.thermochemistry
+        settings = []
+        for key, label in (
+            ("ase_version", "ASE "),
+            ("vib_selection", "mode selection: "),
+            ("ignore_imag_modes", "ignore_imag_modes: "),
+        ):
+            if metadata.get(key) is not None:
+                settings.append(f"{label}{escape(str(metadata[key]))}")
+        if settings:
+            thermo_info.append(f"<div>{'; '.join(settings)}.</div>")
+        if metadata.get("raw_imaginary_mode_count") is not None:
+            thermo_info.append(
+                "<div>Imaginary modes in the complete input: "
+                f"{escape(str(metadata['raw_imaginary_mode_count']))}.</div>"
+            )
+        policy = metadata.get("ignore_imag_modes")
+        if policy is False:
+            thermo_info.append(
+                "<div>Imaginary modes remaining after selection cause an error; "
+                "zero-energy modes are not removed.</div>"
+            )
+        if policy is True:
+            cleanup = "ASE cleanup removes"
+            if metadata.get("n_imag") is not None:
+                cleanup = f"ASE cleanup removed {escape(str(metadata['n_imag']))}"
+            thermo_info.append(
+                f"<div>{cleanup} non-positive modes "
+                "(imaginary or zero energy) after selection.</div>"
+            )
+        elif metadata.get("n_imag") is not None:
+            thermo_info.append(
+                f"<div>ASE n_imag: {escape(str(metadata['n_imag']))}.</div>"
+            )
+        for warning in metadata.get("warnings") or []:
+            thermo_info.append(
+                "<div role='note' class='thermo-warning'>"
+                f"<strong>Warning:</strong> {escape(str(warning))}</div>"
+            )
+
+        # Add data attributes for conversion with labels
+        if "enthalpy" in ase_output.thermochemistry:
+            enthalpy_ev = ase_output.thermochemistry['enthalpy']
+            thermo_info.append(
+                f'<div><strong>Enthalpy:</strong> <span class="energy-value" data-ev="{enthalpy_ev}">{enthalpy_ev:.6f}</span> <span class="energy-unit">eV</span></div>'
+            )
+        if "entropy" in ase_output.thermochemistry:
+            entropy_unit = ase_output.thermochemistry.get("entropy_unit", "eV/K")
+            if entropy_unit != "eV/K":
+                raise ValueError(
+                    f"Unsupported entropy_unit {entropy_unit!r}; expected 'eV/K'. "
+                    "Convert entropy to eV/K before generating a report."
+                )
+            # Legacy ASE results also express entropy in eV/K.
+            entropy_ev_k = ase_output.thermochemistry['entropy']
+            thermo_info.append(
+                f'<div><strong>Entropy:</strong> <span class="entropy-value" data-ev-k="{entropy_ev_k}">{entropy_ev_k:.6f}</span> <span class="entropy-unit">eV/K</span></div>'
+            )
+        if "gibbs_free_energy" in ase_output.thermochemistry:
+            gibbs_ev = ase_output.thermochemistry['gibbs_free_energy']
+            thermo_info.append(
+                f'<div><strong>Gibbs Free Energy:</strong> <span class="energy-value" data-ev="{gibbs_ev}">{gibbs_ev:.6f}</span> <span class="energy-unit">eV</span></div>'
+            )
+
+        if thermo_info:
+            calc_results.append(f"""
+            <li class='regular-item'>
+                <div class="unit-toggle">
+                    <span>Units:</span>
+                    <button onclick="toggleEnergyUnit('ev')" class="active" data-unit="ev">eV</button>
+                    <button onclick="toggleEnergyUnit('kjmol')" data-unit="kjmol">kJ/mol</button>
+                    <button onclick="toggleEnergyUnit('kcalmol')" data-unit="kcalmol">kcal/mol</button>
+                </div>
+                <strong>Thermochemistry Values</strong>:<br>
+                {"".join(thermo_info)}
+            </li>""")
+        else:
+            calc_results.append(
+                "<li class='regular-item'><strong>Thermochemistry Values:</strong> No values available</li>"
+            )
+    else:
+        calc_results.append(
+            "<li class='regular-item'><strong>Thermochemistry Values:</strong> N/A</li>"
+        )
+
+    # Optimization Status
+    if ase_output.simulation_input.driver == "opt":
+        status = "Converged" if ase_output.converged else "Not Converged"
+        status_class = "color: #28a745;" if ase_output.converged else "color: #dc3545;"
+        calc_results.append(
+            f"<li class='regular-item'><strong>Optimization Status:</strong> <span style='{status_class}'>{status}</span></li>"
+        )
+
+    # Error Information
+    if ase_output.error:
+        calc_results.append(
+            f"<li class='regular-item'><strong>Error:</strong> <span style='color: #dc3545;'>{escape(ase_output.error)}</span></li>"
+        )
+
+    # Join all results with proper spacing
+    calc_results_html = "\n".join(calc_results)
+
+    # Simulation Details section
+    sim_details = []
+
+    # Driver and Calculator
+    sim_details.append(
+        f"<li><strong>Simulation Type:</strong> {ase_output.simulation_input.driver or 'N/A'}</li>"
+    )
+
+    if ase_output.simulation_input.calculator:
+        calc = ase_output.simulation_input.calculator
+        calc_type = calc.calculator_type
+        sim_details.append(f"<li><strong>Calculator:</strong> {calc_type}</li>")
+
+        # Get calculator parameters directly from the input
+        calc_params = calc.model_dump()
+
+        # Create a sub-section for calculator parameters
+        calc_params_html = []
+        for param, value in calc_params.items():
+            # Format the parameter name nicely
+            param_name = param.replace('_', ' ').title()
+
+            # Handle boolean values
+            if isinstance(value, bool):
+                value = str(value)
+            # Handle numeric values
+            elif isinstance(value, (int, float)):
+                value = f"{value:.6g}"
+            # Handle None values
+            elif value is None:
+                value = "None"
+
+            calc_params_html.append(f"<tr><td>{param_name}</td><td>{value}</td></tr>")
+
+        # If no parameters are set, show an empty table
+        if not calc_params_html:
+            calc_params_html.append(
+                "<tr><td colspan='2'>No additional parameters set</td></tr>"
+            )
+
+        sim_details.append(f"""
+        <li>
+            <div class='sub-section'>
+                <h3 onclick='toggleSubSection("calc-params")'>Calculator Parameters</h3>
+                <div id='calc-params' class='sub-section-content'>
+                    <div class='table-container' style='max-height: 200px; overflow-y: auto;'>
+                        <table>
+                            <thead>
+                                <tr>
+                                    <th>Parameter</th>
+                                    <th>Value</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                {''.join(calc_params_html)}
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+        </li>""")
+
+    # Optimization Parameters
+    if ase_output.simulation_input.driver == "opt":
+        sim_details.append(
+            f"<li><strong>Optimizer:</strong> {ase_output.simulation_input.optimizer}</li>"
+        )
+        sim_details.append(
+            f"<li><strong>Force Convergence (fmax):</strong> {ase_output.simulation_input.fmax} eV/Å</li>"
+        )
+        sim_details.append(
+            f"<li><strong>Maximum Steps:</strong> {ase_output.simulation_input.steps}</li>"
+        )
+
+    # Thermochemistry Parameters
+    if ase_output.simulation_input.driver == "thermo":
+        if ase_output.simulation_input.temperature:
+            sim_details.append(
+                f"<li><strong>Temperature:</strong> {ase_output.simulation_input.temperature} K</li>"
+            )
+        sim_details.append(
+            f"<li><strong>Pressure:</strong> {ase_output.simulation_input.pressure} Pa</li>"
+        )
+
+    # Join all simulation details
+    sim_details_html = "\n".join(sim_details)
+
+    # Replace the empty content in both sections
+    html_content = html_content.replace(
+        '<ul>\n                    <!-- Results will be populated here -->\n                </ul>',
+        f'<ul>{calc_results_html}</ul>',
+        1,
+    )
+    html_content = html_content.replace(
+        '<ul>\n                    <!-- Simulation details will be populated here -->\n                </ul>',
+        f'<ul>{sim_details_html}</ul>',
+        1,
+    )
+
+    # Add the JavaScript for unit conversion
+    html_content = html_content.replace(
+        '</body>',
+        '''
+        <script>
+            // Conversion factors
+            const EV_TO_KJMOL = 96.485;  // 1 eV = 96.485 kJ/mol
+            const EV_TO_KCALMOL = 23.061;  // 1 eV = 23.061 kcal/mol
+            
+            function toggleEnergyUnit(unit) {
+                // Update button states
+                document.querySelectorAll('.unit-toggle button').forEach(btn => {
+                    btn.classList.toggle('active', btn.dataset.unit === unit);
+                });
+                
+                // Update unit labels
+                document.querySelectorAll('.energy-unit').forEach(label => {
+                    label.textContent = unit === 'ev' ? 'eV' : 
+                                     unit === 'kjmol' ? 'kJ/mol' : 'kcal/mol';
+                });
+                document.querySelectorAll('.entropy-unit').forEach(label => {
+                    label.textContent = unit === 'ev' ? 'eV/K' :
+                                     unit === 'kjmol' ? 'kJ/(mol K)' : 'kcal/(mol K)';
+                });
+                document.querySelectorAll('.entropy-value').forEach(cell => {
+                    const factor = unit === 'ev' ? 1 :
+                                   unit === 'kjmol' ? EV_TO_KJMOL : EV_TO_KCALMOL;
+                    const precision = unit === 'ev' ? 6 : 4;
+                    cell.textContent = (parseFloat(cell.dataset.evK) * factor).toFixed(precision);
+                });
+                
+                // Convert all energy values
+                document.querySelectorAll('.energy-value').forEach(cell => {
+                    const evValue = parseFloat(cell.dataset.ev);
+                    let convertedValue;
+                    let precision;
+                    
+                    if (unit === 'ev') {
+                        convertedValue = evValue;
+                        precision = 6;
+                    } else if (unit === 'kjmol') {
+                        convertedValue = evValue * EV_TO_KJMOL;
+                        precision = 2;
+                    } else {  // kcal/mol
+                        convertedValue = evValue * EV_TO_KCALMOL;
+                        precision = 2;
+                    }
+                    
+                    // Get the label from the parent div's strong element
+                    const label = cell.parentElement.querySelector('strong').textContent;
+                    // Update only the value part
+                    cell.textContent = convertedValue.toFixed(precision);
+                });
+            }
+
+            // Initialize energy values in eV when the page loads
+            document.addEventListener('DOMContentLoaded', function() {
+                // Set initial unit to eV
+                document.querySelectorAll('.unit-toggle button[data-unit="ev"]').forEach(btn => {
+                    btn.click();
+                });
+            });
+        </script>
+        </body>
+        ''',
+    )
+
+    return html_content

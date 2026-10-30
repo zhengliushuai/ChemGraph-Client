@@ -1,0 +1,715 @@
+"""
+Tests for ChemGraph agent session/memory integration.
+
+Covers:
+- Memory initialization options (enable_memory, custom store, db_path)
+- uuid and session_id consistency
+- _ensure_session idempotency
+- _save_messages_to_store with LangChain and dict messages
+- write_state file naming with uuid
+- resume_from flow
+- End-to-end session lifecycle
+"""
+
+import os
+
+import pytest
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
+
+from chemgraph.agent.llm_agent import ChemGraph
+from chemgraph.agent.turn import TurnResult, serialize_state
+from chemgraph.memory.store import SessionStore
+from chemgraph.models.endpoints import PreparedModel
+from langchain_core.language_models.fake_chat_models import FakeListChatModel
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.graph import END, START, MessagesState, StateGraph
+
+
+# ------------------------------------------------------------------
+# Fixtures
+# ------------------------------------------------------------------
+
+
+@pytest.fixture
+def clean_env():
+    """Clear CHEMGRAPH_LOG_DIR for test isolation."""
+    old = os.environ.get("CHEMGRAPH_LOG_DIR")
+    if "CHEMGRAPH_LOG_DIR" in os.environ:
+        del os.environ["CHEMGRAPH_LOG_DIR"]
+    yield
+    if old:
+        os.environ["CHEMGRAPH_LOG_DIR"] = old
+    elif "CHEMGRAPH_LOG_DIR" in os.environ:
+        del os.environ["CHEMGRAPH_LOG_DIR"]
+
+
+@pytest.fixture
+def tmp_db(tmp_path):
+    """Temporary database file."""
+    return str(tmp_path / "test_sessions.db")
+
+
+class _GraphStreamCompatibleWorkflow:
+    def __init__(self):
+        self.side_effect = self.default_graph_stream
+        self.last_state = {"messages": []}
+
+    async def default_graph_stream(self, **kwargs):
+        ai_msg = Mock()
+        ai_msg.type = "ai"
+        ai_msg.content = "Test response"
+        return TurnResult(
+            final_text="Test response",
+            state={"messages": [ai_msg]},
+            executed_tool_names=(),
+            terminal_tool=None,
+            thread_id=kwargs["thread_id"],
+            duration_s=0.0,
+        )
+
+    async def astream(self, inputs, *, stream_mode, config):
+        result = await self.side_effect(
+            query=inputs.get("messages"),
+            thread_id=str(config["configurable"]["thread_id"]),
+        )
+        self.last_state = result.state
+        yield self.last_state
+
+    def get_state(self, config):
+        return SimpleNamespace(values=self.last_state)
+
+
+@pytest.fixture
+def mock_agent_patches():
+    """Patch LLM loading and graph streaming for fast agent creation."""
+    with (
+        patch("chemgraph.agent.llm_agent.load_chat_model_prepared") as mock_load,
+        patch("chemgraph.agent.llm_agent.construct_single_agent_graph") as mock_constructor,
+    ):
+        mock_load.return_value = (
+            Mock(),
+            PreparedModel(
+                endpoint_name="test",
+                protocol="openai_compatible",
+                client_kwargs={},
+            ),
+        )
+        workflow = _GraphStreamCompatibleWorkflow()
+        mock_constructor.return_value = workflow
+        yield mock_load, workflow
+
+
+def _make_agent(clean_env, mock_agent_patches, tmp_db, **kwargs):
+    """Helper to create a ChemGraph with memory pointed at a temp DB."""
+    defaults = {
+        "model_name": "gpt-4o-mini",
+        "enable_memory": True,
+        "memory_db_path": tmp_db,
+        "log_dir": os.path.join(os.path.dirname(tmp_db), "logs"),
+    }
+    defaults.update(kwargs)
+    agent = ChemGraph(**defaults)
+    return agent
+
+
+@pytest.fixture
+def cumulative_agent(clean_env, mock_agent_patches, tmp_db):
+    """Use a compiled graph with its real message reducer and a hermetic LLM."""
+    agent = _make_agent(clean_env, mock_agent_patches, tmp_db)
+    model = FakeListChatModel(responses=["Repeated answer"])
+    builder = StateGraph(MessagesState)
+    builder.add_node("reply", lambda state: {"messages": [model.invoke(state["messages"])]})
+    builder.add_edge(START, "reply")
+    builder.add_edge("reply", END)
+    agent.workflow = builder.compile(checkpointer=InMemorySaver())
+    return agent
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("config", [None, {"thread_id": 7}, {"configurable": {"thread_id": "7"}}])
+async def test_cumulative_turns_are_saved_once(cumulative_agent, config):
+    agent = cumulative_agent
+    for turn in range(1, 4):
+        await agent.run("Repeated question", config=config)
+        session = agent.session_store.get_session(agent.uuid)
+        assert len(session.messages) == 2 * turn
+        assert session.query_count == turn
+    thread_id = "1" if config is None else "7"
+    state = agent.workflow.get_state({"configurable": {"thread_id": thread_id}}).values
+    agent._save_messages_to_store(state, "Repeated question", thread_id=thread_id)
+    assert len(agent.session_store.get_session(agent.uuid).messages) == 6
+
+
+@pytest.mark.asyncio
+async def test_cumulative_history_survives_alternating_threads(cumulative_agent):
+    agent = cumulative_agent
+    for count, thread_id in enumerate(["a", "b", "a", "b"], start=1):
+        await agent.run("Repeated question", config={"thread_id": thread_id})
+        session = agent.session_store.get_session(agent.uuid)
+        assert len(session.messages) == count * 2
+        assert session.query_count == count
+
+
+@pytest.mark.asyncio
+async def test_failed_save_retries_all_unsaved_history(cumulative_agent, monkeypatch):
+    agent = cumulative_agent
+    save = agent.session_store.save_messages
+    monkeypatch.setattr(agent.session_store, "save_messages", Mock(side_effect=RuntimeError("DB unavailable")))
+    await agent.run("First question")
+    assert agent.session_store.get_session(agent.uuid).messages == []
+    monkeypatch.setattr(agent.session_store, "save_messages", save)
+    await agent.run("Second question")
+    session = agent.session_store.get_session(agent.uuid)
+    assert len(session.messages) == 4
+    assert session.query_count == 2
+    state = agent.workflow.get_state({"configurable": {"thread_id": "1"}}).values
+    agent._save_messages_to_store(state, "Second question")
+    assert len(agent.session_store.get_session(agent.uuid).messages) == 4
+
+
+@pytest.mark.parametrize("with_ids", [False, True])
+def test_snapshot_identity_is_scoped_to_normalized_thread(cumulative_agent, with_ids):
+    agent = cumulative_agent
+    agent._ensure_session("Repeated question")
+    messages = [
+        {"type": "human", "content": "Repeated question"},
+        {"type": "tool", "name": "read", "content": [{"type": "text", "text": "same"}]},
+        {"type": "human", "content": "Repeated question"},
+    ]
+    if with_ids:
+        for index, msg in enumerate(messages):
+            msg["id"] = str(index)
+    for thread_id in (7, "7", "other", "other"):
+        # Copies model successive deserialized snapshots, not object identity.
+        agent._save_messages_to_store(
+            {"messages": [dict(msg) for msg in messages]}, "Repeated question", thread_id=thread_id
+        )
+    if with_ids:
+        agent._save_messages_to_store(
+            {"messages": messages[1:] + messages[:1]}, "Repeated question", thread_id="7"
+        )
+    session = agent.session_store.get_session(agent.uuid)
+    assert len(session.messages) == 6
+    assert session.query_count == 4
+    assert [message.content for message in session.messages] == ["Repeated question", "same", "Repeated question"] * 2
+
+
+def test_idless_snapshot_tracks_payload_changes(cumulative_agent):
+    agent = cumulative_agent
+    agent._ensure_session("Question")
+    for text in ("original", "updated", "updated"):
+        agent._save_messages_to_store({"messages": [{"type": "ai", "content": text}]}, "Question")
+    assert [message.content for message in agent.session_store.get_session(agent.uuid).messages] == ["original", "updated"]
+
+
+# ------------------------------------------------------------------
+# Memory initialization
+# ------------------------------------------------------------------
+
+
+class TestMemoryInitialization:
+    def test_enable_memory_true_creates_store(
+        self, clean_env, mock_agent_patches, tmp_db
+    ):
+        agent = _make_agent(clean_env, mock_agent_patches, tmp_db, enable_memory=True)
+        assert agent.session_store is not None
+        assert isinstance(agent.session_store, SessionStore)
+
+    def test_enable_memory_false_no_store(self, clean_env, mock_agent_patches, tmp_db):
+        agent = _make_agent(clean_env, mock_agent_patches, tmp_db, enable_memory=False)
+        assert agent.session_store is None
+
+    def test_custom_session_store(self, clean_env, mock_agent_patches, tmp_db):
+        custom_store = SessionStore(db_path=tmp_db)
+        agent = _make_agent(
+            clean_env,
+            mock_agent_patches,
+            tmp_db,
+            session_store=custom_store,
+        )
+        assert agent.session_store is custom_store
+
+    def test_custom_db_path(self, clean_env, mock_agent_patches, tmp_path):
+        db_path = str(tmp_path / "custom.db")
+        agent = _make_agent(
+            clean_env,
+            mock_agent_patches,
+            str(tmp_path / "unused.db"),
+            memory_db_path=db_path,
+        )
+        assert agent.session_store is not None
+        assert agent.session_store.db_path == db_path
+
+    def test_session_created_flag_initially_false(
+        self, clean_env, mock_agent_patches, tmp_db
+    ):
+        agent = _make_agent(clean_env, mock_agent_patches, tmp_db)
+        assert agent._session_created is False
+
+
+# ------------------------------------------------------------------
+# UUID and session_id
+# ------------------------------------------------------------------
+
+
+class TestUuidSessionId:
+    def test_uuid_always_set(self, clean_env, mock_agent_patches, tmp_db):
+        agent = _make_agent(clean_env, mock_agent_patches, tmp_db)
+        assert agent.uuid is not None
+        assert len(agent.uuid) == 8
+
+    def test_uuid_set_when_log_dir_preset(self, mock_agent_patches, tmp_db):
+        """uuid must be set even when CHEMGRAPH_LOG_DIR is already in env."""
+        os.environ["CHEMGRAPH_LOG_DIR"] = "/tmp/preset_log_dir"
+        try:
+            agent = _make_agent(None, mock_agent_patches, tmp_db, log_dir=None)
+            assert agent.uuid is not None
+            assert len(agent.uuid) == 8
+            assert agent.log_dir == "/tmp/preset_log_dir"
+        finally:
+            del os.environ["CHEMGRAPH_LOG_DIR"]
+
+    def test_session_id_property_returns_uuid(
+        self, clean_env, mock_agent_patches, tmp_db
+    ):
+        agent = _make_agent(clean_env, mock_agent_patches, tmp_db)
+        assert agent.session_id == agent.uuid
+
+    def test_session_id_is_str_not_optional(
+        self, clean_env, mock_agent_patches, tmp_db
+    ):
+        agent = _make_agent(clean_env, mock_agent_patches, tmp_db)
+        assert isinstance(agent.session_id, str)
+
+    def test_two_agents_have_different_uuids(
+        self, clean_env, mock_agent_patches, tmp_db
+    ):
+        agent1 = _make_agent(clean_env, mock_agent_patches, tmp_db)
+        # Second agent needs a fresh env since first sets CHEMGRAPH_LOG_DIR
+        if "CHEMGRAPH_LOG_DIR" in os.environ:
+            del os.environ["CHEMGRAPH_LOG_DIR"]
+        agent2 = _make_agent(clean_env, mock_agent_patches, tmp_db)
+        assert agent1.uuid != agent2.uuid
+
+
+# ------------------------------------------------------------------
+# _ensure_session
+# ------------------------------------------------------------------
+
+
+class TestEnsureSession:
+    def test_creates_session_in_store(self, clean_env, mock_agent_patches, tmp_db):
+        agent = _make_agent(clean_env, mock_agent_patches, tmp_db)
+        agent._ensure_session("What is water?")
+
+        assert agent._session_created is True
+        session = agent.session_store.get_session(agent.uuid)
+        assert session is not None
+        assert session.session_id == agent.uuid
+        assert session.model_name == "gpt-4o-mini"
+        assert session.workflow_type == "single_agent"
+
+    def test_generates_title_from_query(self, clean_env, mock_agent_patches, tmp_db):
+        agent = _make_agent(clean_env, mock_agent_patches, tmp_db)
+        agent._ensure_session("Please calculate the energy of water")
+
+        session = agent.session_store.get_session(agent.uuid)
+        assert session.title == "Calculate the energy of water"
+
+    def test_idempotent_on_second_call(self, clean_env, mock_agent_patches, tmp_db):
+        agent = _make_agent(clean_env, mock_agent_patches, tmp_db)
+        agent._ensure_session("First query")
+        agent._ensure_session("Second query")
+
+        # Should still have only one session
+        assert agent.session_store.session_count() == 1
+        # Title should be from the first query
+        session = agent.session_store.get_session(agent.uuid)
+        assert "First" in session.title
+
+    def test_stores_log_dir(self, clean_env, mock_agent_patches, tmp_db):
+        agent = _make_agent(clean_env, mock_agent_patches, tmp_db)
+        agent._ensure_session("test query")
+
+        session = agent.session_store.get_session(agent.uuid)
+        assert session.log_dir == agent.log_dir
+
+    def test_noop_when_memory_disabled(self, clean_env, mock_agent_patches, tmp_db):
+        agent = _make_agent(clean_env, mock_agent_patches, tmp_db, enable_memory=False)
+        # Should not raise
+        agent._ensure_session("test query")
+        assert agent._session_created is False
+
+
+# ------------------------------------------------------------------
+# _save_messages_to_store
+# ------------------------------------------------------------------
+
+
+class TestSaveMessagesToStore:
+    def test_saves_langchain_messages(self, clean_env, mock_agent_patches, tmp_db):
+        agent = _make_agent(clean_env, mock_agent_patches, tmp_db)
+        agent._ensure_session("test query")
+
+        # Simulate LangChain message objects
+        human_msg = Mock()
+        human_msg.type = "human"
+        human_msg.content = "What is water?"
+
+        ai_msg = Mock()
+        ai_msg.type = "ai"
+        ai_msg.content = "Water is H2O."
+
+        tool_msg = Mock()
+        tool_msg.type = "tool"
+        tool_msg.content = '{"smiles": "O"}'
+        tool_msg.name = "molecule_name_to_smiles"
+
+        state = {"messages": [human_msg, ai_msg, tool_msg]}
+        agent._save_messages_to_store(state, "test query")
+
+        session = agent.session_store.get_session(agent.uuid)
+        assert len(session.messages) == 3
+        assert session.messages[0].role == "human"
+        assert session.messages[1].role == "ai"
+        assert session.messages[2].role == "tool"
+        assert session.messages[2].tool_name == "molecule_name_to_smiles"
+
+    def test_saves_dict_messages(self, clean_env, mock_agent_patches, tmp_db):
+        agent = _make_agent(clean_env, mock_agent_patches, tmp_db)
+        agent._ensure_session("test query")
+
+        state = {
+            "messages": [
+                {"type": "human", "content": "Hello"},
+                {"role": "ai", "content": "Hi there"},
+            ]
+        }
+        agent._save_messages_to_store(state, "test query")
+
+        session = agent.session_store.get_session(agent.uuid)
+        assert len(session.messages) == 2
+
+    def test_saves_full_content_without_truncation(
+        self, clean_env, mock_agent_patches, tmp_db
+    ):
+        agent = _make_agent(clean_env, mock_agent_patches, tmp_db)
+        agent._ensure_session("test query")
+
+        long_msg = Mock()
+        long_msg.type = "ai"
+        long_msg.content = "A" * 15000
+
+        state = {"messages": [long_msg]}
+        agent._save_messages_to_store(state, "test query")
+
+        session = agent.session_store.get_session(agent.uuid)
+        assert len(session.messages) == 1
+        # Content should be saved in full — no truncation at save time
+        assert len(session.messages[0].content) == 15000
+        assert session.messages[0].content == "A" * 15000
+
+    def test_noop_when_memory_disabled(self, clean_env, mock_agent_patches, tmp_db):
+        agent = _make_agent(clean_env, mock_agent_patches, tmp_db, enable_memory=False)
+        state = {"messages": [{"type": "human", "content": "Hello"}]}
+        # Should not raise
+        agent._save_messages_to_store(state, "test query")
+
+    def test_noop_when_session_not_created(self, clean_env, mock_agent_patches, tmp_db):
+        agent = _make_agent(clean_env, mock_agent_patches, tmp_db)
+        # Don't call _ensure_session
+        state = {"messages": [{"type": "human", "content": "Hello"}]}
+        agent._save_messages_to_store(state, "test query")
+        # Store should have no sessions
+        assert agent.session_store.session_count() == 0
+
+    def test_skips_messages_without_content(
+        self, clean_env, mock_agent_patches, tmp_db
+    ):
+        agent = _make_agent(clean_env, mock_agent_patches, tmp_db)
+        agent._ensure_session("test query")
+
+        empty_msg = Mock()
+        empty_msg.type = "ai"
+        empty_msg.content = ""
+
+        state = {"messages": [empty_msg]}
+        agent._save_messages_to_store(state, "test query")
+
+        session = agent.session_store.get_session(agent.uuid)
+        assert len(session.messages) == 0  # Empty content is skipped
+
+    def test_handles_exception_gracefully(self, clean_env, mock_agent_patches, tmp_db):
+        agent = _make_agent(clean_env, mock_agent_patches, tmp_db)
+        agent._ensure_session("test query")
+
+        # Force an exception during save
+        agent.session_store.save_messages = Mock(side_effect=RuntimeError("DB error"))
+
+        msg = Mock()
+        msg.type = "human"
+        msg.content = "Hello"
+        state = {"messages": [msg]}
+
+        # Should not raise — logs a warning instead
+        agent._save_messages_to_store(state, "test query")
+
+
+# ------------------------------------------------------------------
+# write_state file naming
+# ------------------------------------------------------------------
+
+
+def test_serialize_state_handles_circular_references():
+    state = {"messages": []}
+    state["self"] = state
+
+    serialized = serialize_state(state)
+
+    assert serialized["messages"] == []
+    assert serialized["self"] == "<circular reference: dict>"
+
+
+def test_serialize_state_handles_mock_objects_without_recursion():
+    state = {"message": Mock()}
+
+    serialized = serialize_state(state)
+
+    assert isinstance(serialized["message"], str)
+
+
+class TestWriteStateFileNaming:
+    def test_filename_includes_uuid(
+        self, clean_env, mock_agent_patches, tmp_db, tmp_path
+    ):
+        agent = _make_agent(clean_env, mock_agent_patches, tmp_db)
+
+        agent._last_run_state = {"messages": []}
+
+        log_dir = str(tmp_path / "test_logs")
+        os.makedirs(log_dir, exist_ok=True)
+        agent.log_dir = log_dir
+
+        config = {"configurable": {"thread_id": "42"}}
+        result = agent.write_state(config=config)
+
+        assert result != "Error"
+        # Find the file that was written
+        files = os.listdir(log_dir)
+        json_files = [f for f in files if f.endswith(".json")]
+        assert len(json_files) == 1
+        fname = json_files[0]
+
+        # Filename should contain thread_id and uuid
+        assert f"thread_42_{agent.uuid}" in fname
+
+    def test_no_overwrite_same_second(
+        self, clean_env, mock_agent_patches, tmp_db, tmp_path
+    ):
+        """Two agents writing to the same dir at the same second don't collide."""
+        log_dir = str(tmp_path / "shared_logs")
+        os.makedirs(log_dir, exist_ok=True)
+
+        agents = []
+        for _ in range(2):
+            if "CHEMGRAPH_LOG_DIR" in os.environ:
+                del os.environ["CHEMGRAPH_LOG_DIR"]
+            a = _make_agent(clean_env, mock_agent_patches, tmp_db)
+            a._last_run_state = {"messages": []}
+            a.log_dir = log_dir
+            agents.append(a)
+
+        config = {"configurable": {"thread_id": "1"}}
+        agents[0].write_state(config=config)
+        agents[1].write_state(config=config)
+
+        # Should be 2 distinct files (or at least not overwritten) thanks to uuid
+        # They may have identical timestamps but different uuids
+        assert agents[0].uuid != agents[1].uuid
+
+
+# ------------------------------------------------------------------
+# resume_from flow
+# ------------------------------------------------------------------
+
+
+class TestResumeFrom:
+    def _make_streamable_agent(self, clean_env, mock_agent_patches, tmp_db):
+        """Create an agent whose run path is mocked through graph stream."""
+        return _make_agent(clean_env, mock_agent_patches, tmp_db)
+
+    @pytest.mark.asyncio
+    async def test_resume_prepends_context(self, clean_env, mock_agent_patches, tmp_db):
+        # Create first agent and seed a session
+        agent1 = self._make_streamable_agent(clean_env, mock_agent_patches, tmp_db)
+        await agent1.run("What is water?")
+
+        session_id = agent1.uuid
+
+        # Clear env for second agent
+        if "CHEMGRAPH_LOG_DIR" in os.environ:
+            del os.environ["CHEMGRAPH_LOG_DIR"]
+
+        # Create second agent sharing the same DB
+        agent2 = self._make_streamable_agent(clean_env, mock_agent_patches, tmp_db)
+
+        # Track what query is passed to graph stream.
+        captured_inputs = []
+
+        async def tracking_graph_stream(**kwargs):
+            captured_inputs.append({"messages": kwargs["query"]})
+            ai_msg = Mock()
+            ai_msg.type = "ai"
+            ai_msg.content = "Follow-up response"
+            return TurnResult(
+                final_text="Follow-up response",
+                state={"messages": [ai_msg]},
+                executed_tool_names=(),
+                terminal_tool=None,
+                thread_id=kwargs["thread_id"],
+                duration_s=0.0,
+            )
+
+        mock_agent_patches[1].side_effect = tracking_graph_stream
+
+        await agent2.run("Continue the analysis", resume_from=session_id)
+
+        # The query should contain the previous context
+        assert len(captured_inputs) == 1
+        query = captured_inputs[0]["messages"]
+        assert "Previous Session Context" in query
+        assert "continuing from the previous session" in query
+
+    @pytest.mark.asyncio
+    async def test_resume_from_nonexistent_session(
+        self, clean_env, mock_agent_patches, tmp_db
+    ):
+        agent = self._make_streamable_agent(clean_env, mock_agent_patches, tmp_db)
+
+        captured_inputs = []
+
+        async def tracking_graph_stream(**kwargs):
+            captured_inputs.append({"messages": kwargs["query"]})
+            ai_msg = Mock()
+            ai_msg.type = "ai"
+            ai_msg.content = "Response"
+            return TurnResult(
+                final_text="Response",
+                state={"messages": [ai_msg]},
+                executed_tool_names=(),
+                terminal_tool=None,
+                thread_id=kwargs["thread_id"],
+                duration_s=0.0,
+            )
+
+        mock_agent_patches[1].side_effect = tracking_graph_stream
+
+        await agent.run("Hello", resume_from="nonexistent_id")
+
+        # No context should be prepended for a nonexistent session
+        query = captured_inputs[0]["messages"]
+        assert "Previous Session Context" not in query
+        assert query == "Hello"
+
+    @pytest.mark.asyncio
+    async def test_resume_from_ignored_when_memory_disabled(
+        self, clean_env, mock_agent_patches, tmp_db
+    ):
+        agent = _make_agent(clean_env, mock_agent_patches, tmp_db, enable_memory=False)
+
+        captured_inputs = []
+
+        async def tracking_graph_stream(**kwargs):
+            captured_inputs.append({"messages": kwargs["query"]})
+            ai_msg = Mock()
+            ai_msg.type = "ai"
+            ai_msg.content = "Response"
+            return TurnResult(
+                final_text="Response",
+                state={"messages": [ai_msg]},
+                executed_tool_names=(),
+                terminal_tool=None,
+                thread_id=kwargs["thread_id"],
+                duration_s=0.0,
+            )
+
+        mock_agent_patches[1].side_effect = tracking_graph_stream
+
+        await agent.run("Hello", resume_from="some_id")
+
+        query = captured_inputs[0]["messages"]
+        assert query == "Hello"
+
+
+# ------------------------------------------------------------------
+# End-to-end session lifecycle
+# ------------------------------------------------------------------
+
+
+class TestEndToEndSessionLifecycle:
+    @pytest.mark.asyncio
+    async def test_full_lifecycle(self, clean_env, mock_agent_patches, tmp_db):
+        """init -> run -> messages saved -> load_previous_context -> resume"""
+        agent = _make_agent(clean_env, mock_agent_patches, tmp_db)
+
+        human_msg = Mock()
+        human_msg.type = "human"
+        human_msg.content = "Calculate energy of H2"
+
+        ai_msg = Mock()
+        ai_msg.type = "ai"
+        ai_msg.content = "The energy of H2 is -1.17 eV using MACE."
+        ai_msg.pretty_print = Mock()
+
+        final_state = {"messages": [human_msg, ai_msg]}
+
+        async def mock_graph_stream(**kwargs):
+            return TurnResult(
+                final_text=ai_msg.content,
+                state=final_state,
+                executed_tool_names=(),
+                terminal_tool=None,
+                thread_id=kwargs["thread_id"],
+                duration_s=0.0,
+            )
+
+        mock_agent_patches[1].side_effect = mock_graph_stream
+
+        # Step 1: Run
+        await agent.run("Calculate energy of H2")
+
+        # Step 2: Verify session was created
+        assert agent._session_created is True
+        session = agent.session_store.get_session(agent.uuid)
+        assert session is not None
+        assert len(session.messages) == 2
+
+        # Step 3: Verify load_previous_context works
+        context = agent.load_previous_context(agent.uuid)
+        assert "Previous Session Context" in context
+        assert "H2" in context
+
+        # Step 4: Verify session_id property
+        assert agent.session_id == agent.uuid
+
+        # Step 5: Create new agent and resume
+        if "CHEMGRAPH_LOG_DIR" in os.environ:
+            del os.environ["CHEMGRAPH_LOG_DIR"]
+
+        agent2 = _make_agent(clean_env, mock_agent_patches, tmp_db)
+        mock_agent_patches[1].side_effect = mock_graph_stream
+
+        await agent2.run("Now optimize H2", resume_from=agent.uuid)
+
+        # Second agent should also have a session
+        assert agent2._session_created is True
+        assert agent2.uuid != agent.uuid
+
+    @pytest.mark.asyncio
+    async def test_load_previous_context_disabled_memory(
+        self, clean_env, mock_agent_patches, tmp_db
+    ):
+        agent = _make_agent(clean_env, mock_agent_patches, tmp_db, enable_memory=False)
+        result = agent.load_previous_context("some_id")
+        assert result == ""

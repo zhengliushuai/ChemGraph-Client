@@ -1,0 +1,87 @@
+# Byte-compiled / cache files
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pyc
+**/__pycache__/
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+eggs/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# IDEs / editors
+.vscode/
+.idea/
+*.iml
+
+# Pytest cache
+.pytest_cache/
+
+# MacOS
+.DS_Store
+
+# Jupyter Notebook checkpoints and modified notebooks
+.ipynb_checkpoints/
+
+# env
+chemgraph-env/
+# env
+.env
+# Log files
+*run_logs/
+*vib/
+plots/
+initial_evaluations/
+test/
+test_outputs/
+*ir/
+
+.venv
+combine*
+
+# OpenCode (user-local config; copy from opencode.example.jsonc)
+opencode.json
+chemgraph_mcp_logs/
+vllm/
+logs/
+runs/
+**/*.model
+error_log.txt
+.env
+test.csv
+nwchem/
+nwchem.nwi
+nwchem.nwo
+vib*.traj
+
+# Kubernetes secrets (keep secrets.yaml.template, ignore actual secrets)
+k8s/secrets.yaml
+
+# ChemGraph agent session logs (per-machine, per-run)
+cg_logs/
+**/cg_logs/
+
+# IRI benchmark / eval notebook artifacts (per-machine, personal analysis)
+notebooks/iri_*_results.json
+notebooks/iri_*_first_turn.json
+notebooks/iri_*_dataset.json
+
+# Agent/UI generated artifacts (written to the launch dir by older versions)
+ir_spectrum*.png
+frequencies*.csv
+*_report.html
+report.html
+output.json
+output.xyz
+molecule.xyz
+optimized_*.xyz
+*_structure.xyz
+ui_artifacts.json
+*_opt.traj

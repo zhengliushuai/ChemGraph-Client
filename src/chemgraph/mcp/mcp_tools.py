@@ -1,0 +1,153 @@
+"""FastMCP server exposing general chemistry tools.
+
+The ``run_ase`` tool delegates to :func:`chemgraph.tools.ase_core.run_ase_core`
+so that the simulation logic lives in a single place.
+"""
+
+from __future__ import annotations
+
+from typing import Literal
+
+from mcp.server.fastmcp import FastMCP
+
+from chemgraph.tools.ase_core import extract_output_json_core, run_ase_core
+from chemgraph.tools.cheminformatics_core import (
+    molecule_name_to_smiles_core,
+    smiles_to_coordinate_file_core,
+)
+from chemgraph.schemas.ase_input import ASEInputSchema
+
+
+mcp = FastMCP(
+    name="ChemGraph General Tools",
+    instructions="""
+        You provide chemistry tools for converting molecule names to SMILES,
+        building 3D coordinates, running ASE simulations (geometry optimization, thermochemistry, vibrational calculations), and reading results. "
+        Each tool has its own description — follow those to decide when to use them.\n\n
+        General guidance:\n
+        • Keep outputs compact; large results are written to files.\n
+        • Do not invent data. If a tool raises an error, report it as-is.\n
+        • Use absolute file paths when returning artifacts.\n
+        • Energies are in eV, vibrational frequencies in cm⁻¹, wall times in seconds.
+    """,
+)
+
+
+@mcp.tool(
+    name="molecule_name_to_smiles",
+    description=(
+        "Convert a molecule name to a SMILES string using PubChem. "
+        "Set include_stereochemistry=true to distinguish enantiomers."
+    ),
+)
+async def molecule_name_to_smiles(
+    name: str, include_stereochemistry: bool = False
+) -> str:
+    """Resolve a molecule name to its SMILES via PubChem.
+
+    Parameters
+    ----------
+    name : str
+        Molecule name to resolve.
+    include_stereochemistry : bool, optional
+        Set to True to keep stereochemistry, which is required to tell
+        enantiomers apart: with the default of False, "L-alanine" and
+        "D-alanine" both resolve to the same SMILES.
+
+    Returns
+    -------
+    str
+        SMILES string.
+    """
+    return molecule_name_to_smiles_core(
+        name, include_stereochemistry=include_stereochemistry
+    )
+
+
+@mcp.tool(
+    name="smiles_to_coordinate_file",
+    description="Convert a SMILES string to a coordinate file",
+)
+async def smiles_to_coordinate_file(
+    smiles: str,
+    output_file: str = "molecule.xyz",
+    seed: int = 2025,
+    fmt: Literal["xyz"] = "xyz",
+) -> dict:
+    """Convert a SMILES string to a coordinate file on disk.
+
+    Parameters
+    ----------
+    smiles : str
+        Input SMILES string.
+    output_file : str, optional
+        Coordinate file path to write.
+    seed : int, optional
+        Random seed used for conformer generation.
+    fmt : {"xyz"}, optional
+        Output coordinate format.
+
+    Returns
+    -------
+    dict
+        Coordinate-generation result metadata.
+    """
+    return smiles_to_coordinate_file_core(
+        smiles, output_file=output_file, seed=seed, fmt=fmt
+    )
+
+
+@mcp.tool(
+    name="extract_output_json",
+    description="Load simulation results from a JSON file produced by run_ase.",
+)
+def extract_output_json(json_file: str) -> dict:
+    """Load simulation results from a JSON file produced by run_ase.
+
+    Parameters
+    ----------
+    json_file : str
+        Path to the JSON output file.
+
+    Returns
+    -------
+    dict
+        Parsed simulation results.
+    """
+    return extract_output_json_core(json_file)
+
+
+@mcp.tool(
+    name="run_ase",
+    description="Run ASE calculations using specified input parameters.",
+)
+async def run_ase(params: ASEInputSchema) -> dict:
+    """Run ASE calculations using specified input parameters.
+
+    Parameters
+    ----------
+    params : ASEInputSchema
+        Input parameters for the ASE calculation
+
+    Returns
+    -------
+    dict
+        Output containing calculation status
+
+    Raises
+    ------
+    ValueError
+        If the calculator is not supported or if the calculation fails
+    """
+    import io
+    from contextlib import redirect_stdout
+
+    f = io.StringIO()
+    with redirect_stdout(f):
+        return run_ase_core(params)
+
+
+if __name__ == "__main__":
+    from chemgraph.mcp.server_utils import run_mcp_server
+
+    run_mcp_server(mcp, default_port=9003)

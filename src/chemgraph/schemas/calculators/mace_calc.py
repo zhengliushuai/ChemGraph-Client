@@ -1,0 +1,318 @@
+"""MACE foundation models parameters for ChemGraph
+Reference: https://github.com/ACEsuit/mace/blob/main/mace/calculators/foundations_models.py"""
+
+import functools
+import logging
+import os
+import tempfile
+import threading
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Literal, Optional, Union
+from pydantic import BaseModel, Field
+import torch
+
+from chemgraph.utils import calculator_defaults
+from chemgraph.utils.calculator_defaults import get_default_mace_calculator_type
+
+_logger = logging.getLogger(__name__)
+
+_DEFAULT_MODEL_NAMES = {
+    "mace_polar": "polar-1-m",
+    "mace_mp": "medium-mpa-0",
+    "mace_off": "medium",
+}
+
+
+def _calculator_type_schema(schema: dict) -> None:
+    """Expose the detected default and availability to schema consumers."""
+    schema["default"] = get_default_mace_calculator_type()
+    availability = "installed" if schema["default"] == "mace_polar" else "not installed"
+    schema["description"] += f" The MACE-Polar add-on is {availability} in this environment."
+
+# Process-wide lock for MACE operations.
+# MACE model deserialization (torch.load) triggers torch.fx.symbolic_trace
+# inside Contraction.__init__, which temporarily patches
+# torch.nn.Module.__call__ at the class level.  Concurrent model loading
+# or inference in another thread can then enter the patched __call__,
+# causing "NameError: module is not installed as a submodule".
+# See: https://github.com/argonne-lcf/ChemGraph/issues/110
+_mace_lock = threading.Lock()
+
+
+@functools.lru_cache(maxsize=1)
+def _mace_lockfile_path() -> Optional[str]:
+    """Return the path of the per-node MACE init lock file, or ``None`` if
+    no writable directory is available. Memoised so we only resolve once."""
+    candidates = [
+        os.environ.get("CHEMGRAPH_MACE_LOCK_DIR"),
+        os.environ.get("TMPDIR"),
+        tempfile.gettempdir(),
+        str(Path.home() / ".cache" / "chemgraph"),
+    ]
+    uid = os.getuid() if hasattr(os, "getuid") else "unknown"
+    for d in candidates:
+        if not d:
+            continue
+        try:
+            Path(d).mkdir(parents=True, exist_ok=True)
+            path = str(Path(d) / f"chemgraph_mace_init.{uid}.lock")
+            # Touch to confirm we can write.
+            with open(path, "a"):
+                pass
+            return path
+        except OSError:
+            continue
+    return None
+
+
+@contextmanager
+def mace_loading_lock():
+    """Serialize MACE model loads across both threads and processes on one node.
+
+    EnsembleLauncher's ``AsyncProcessPool`` spawns multiple Python workers in
+    parallel; a per-process :data:`_mace_lock` is not enough because torch's
+    ``symbolic_trace`` patches ``torch.nn.Module.__call__`` at the class level
+    during MACE deserialization, and concurrent loads in sibling processes
+    racing on the same node can deadlock or trip the same NameError that #110
+    describes. We add an ``fcntl.flock``-based file lock on top so that
+    siblings on the same node take turns.
+
+    Degrades to thread-only locking when ``fcntl`` is unavailable (e.g.
+    Windows) or no writable lock directory exists.
+    """
+    try:
+        import fcntl
+    except ImportError:
+        fcntl = None  # type: ignore[assignment]
+
+    path = _mace_lockfile_path() if fcntl is not None else None
+    fh = None
+    try:
+        with _mace_lock:
+            if path is not None:
+                fh = open(path, "w")
+                try:
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+                except OSError as exc:
+                    _logger.warning(
+                        "fcntl.flock on %s failed (%s); proceeding without "
+                        "inter-process MACE serialization.",
+                        path,
+                        exc,
+                    )
+                    fh.close()
+                    fh = None
+            yield
+    finally:
+        if fh is not None:
+            try:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+            finally:
+                fh.close()
+
+
+class MaceCalc(BaseModel):
+    """MACE (Message-passing Atomic and Continuous Environment) calculator configuration.
+
+    This class defines the configuration parameters for MACE machine learning models
+    used in molecular simulations. It supports different calculator types including
+    MACE-Polar, MACE-MP, MACE-OFF, and MACE-ANI-CC. MACE-Polar predicts
+    molecular dipole moments in addition to energies and forces.
+
+    Parameters
+    ----------
+    calculator_type : str, optional
+        Type of calculator to use: 'mace_polar', 'mace_mp', 'mace_off', or
+        'mace_anicc'. Defaults to Polar when its add-on is installed, else MACE-MP.
+    model : str or Path, optional
+        Name or path to the model file. If None, uses default model for selected calculator type.
+    device : str, optional
+        Device to use for calculations ('cpu' or 'cuda' or 'xpu'), by default 'cpu'
+    default_dtype : str, optional
+        Default data type for the model, by default 'float64'. Use 'float32' if device is 'xpu'.
+    charge : int, optional
+        Total system charge used by MACE-Polar, by default 0.
+    multiplicity : int, optional
+        Spin multiplicity used by MACE-Polar, by default 1 (singlet).
+    external_field : tuple of float, optional
+        External electric field used by MACE-Polar, by default zero.
+    dispersion : bool, optional
+        Whether to use D3 dispersion corrections (only for 'mace_mp'), by default False
+    damping : str, optional
+        Damping function for dispersion correction (only for 'mace_mp'),
+        options: ['zero', 'bj', 'zerom', 'bjm'], by default 'bj'
+    dispersion_xc : str, optional
+        Exchange-correlation functional for D3 dispersion corrections (only for 'mace_mp'),
+        by default 'pbe'
+    dispersion_cutoff : float, optional
+        Cutoff radius in Bohr for D3 dispersion corrections (only for 'mace_mp'),
+        by default 21.167088422553647 (40.0 * units.Bohr)
+    """
+
+    calculator_type: Literal[
+        "mace_polar", "mace_mp", "mace_off", "mace_anicc"
+    ] = Field(
+        default_factory=get_default_mace_calculator_type,
+        json_schema_extra=_calculator_type_schema,
+        description="Type of calculator. Defaults to 'mace_polar' when the "
+        "graph-longrange add-on is installed, otherwise 'mace_mp'. Other options "
+        "are 'mace_off' and 'mace_anicc'. MACE-Polar supports "
+        "energies, forces, and molecular dipole moments.",
+    )
+    model: Optional[Union[str, Path]] = Field(
+        default=None,
+        description="Path to the model. If None, ChemGraph selects 'polar-1-m' "
+        "for mace_polar; MACE selects its own default for other calculator types. "
+        "ChemGraph records the resolved model name in successful simulation output. "
+        "Options include: 'polar-1-s', 'polar-1-m', 'polar-1-l', 'small', "
+        "'medium', 'large', 'small-0b', 'medium-0b', 'small-0b2', "
+        "'medium-0b2', 'large-0b2', 'medium-0b3', 'medium-mpa-0', "
+        "'medium-omat-0', 'mace-matpes-pbe-0', and 'mace-matpes-r2scan-0'.",
+    )
+    device: str = Field(
+        default="cpu",
+        description="Device to use for calculations (e.g., 'cpu', 'cuda', 'xpu').",
+    )
+    default_dtype: str = Field(
+        default="float64",
+        description="Default dtype for the model (float32 or float64).",
+    )
+    charge: int = Field(
+        default=0,
+        description="Total system charge used by MACE-Polar.",
+    )
+    multiplicity: int = Field(
+        default=1,
+        ge=1,
+        description="Spin multiplicity used by MACE-Polar.",
+    )
+    external_field: tuple[float, float, float] = Field(
+        default=(0.0, 0.0, 0.0),
+        description="External electric field used by MACE-Polar.",
+    )
+    dispersion: bool = Field(
+        default=False,
+        description="Whether to use D3 dispersion corrections (only for 'mace_mp').",
+    )
+    damping: str = Field(
+        default="bj",
+        description="Damping function for dispersion correction (only for 'mace_mp'). Options: ['zero', 'bj', 'zerom', 'bjm'].",
+    )
+    dispersion_xc: str = Field(
+        default="pbe",
+        description="Exchange-correlation functional for D3 dispersion corrections (only for 'mace_mp').",
+    )
+    dispersion_cutoff: float = Field(
+        default=21.167088422553647,  # Equivalent to 40.0 * units.Bohr,
+        description="Cutoff radius in Bohr for D3 dispersion corrections (only for 'mace_mp').",
+    )
+
+    def get_model_name_for_output(self) -> Optional[Union[str, Path]]:
+        """Return the model identifier to record in simulation output.
+
+        This supplies ChemGraph's maintained name for an omitted model so
+        persisted simulation metadata is not ambiguous. MACE-Polar also uses
+        the resolved name because its upstream loader requires one explicitly.
+        """
+        if self.model is not None:
+            return self.model
+        return _DEFAULT_MODEL_NAMES.get(self.calculator_type)
+
+    def get_atoms_properties(self) -> dict:
+        """Return atom-level metadata required by MACE-Polar."""
+        if self.calculator_type != "mace_polar":
+            return {}
+        return {
+            "charge": self.charge,
+            "spin": self.multiplicity,
+            "external_field": list(self.external_field),
+        }
+
+    def get_multiplicity(self) -> int:
+        """Return spin multiplicity for thermochemistry."""
+        return self.multiplicity
+
+    def get_calculator(self):
+        """Get the appropriate MACECalculator instance based on the selected calculator type.
+
+        The caller is responsible for acquiring ``_mace_lock`` before
+        calling this method when thread-safety is required (see
+        ``ase_tools.run_ase``).
+
+        Returns
+        -------
+        MACECalculator
+            An instance of the appropriate MACE calculator
+
+        Raises
+        ------
+        ValueError
+            If an invalid calculator_type is specified
+        """
+        if self.calculator_type == "mace_polar" and not calculator_defaults.mace_polar_available():
+            raise ImportError(
+                "MACE-Polar requires the graph-longrange add-on. From the root of the matching "
+                "ChemGraph source checkout or extracted source distribution, run "
+                "'python -m pip install -r requirements/mace-polar.txt'. "
+                "See https://argonne-lcf.github.io/ChemGraph/calculators/ "
+                "for versioned installation instructions."
+            )
+
+        from mace.modules.models import ScaleShiftMACE
+
+        # Allow loading slice and ScaleShiftMACE objects for compatibility with older model files
+        torch.serialization.add_safe_globals([slice, ScaleShiftMACE])
+
+        # Force torch to disable weights_only loading (allows full pickle loads) for MACE models
+        os.environ["TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD"] = "1"
+
+        if self.calculator_type == "mace_polar":
+            from mace.calculators import mace_polar
+
+            calculator = mace_polar(
+                model=self.model or _DEFAULT_MODEL_NAMES["mace_polar"],
+                device=self.device,
+                default_dtype=self.default_dtype,
+            )
+            implemented_properties = getattr(
+                calculator, "implemented_properties", None
+            )
+            if (
+                implemented_properties is not None
+                and "dipole" not in implemented_properties
+            ):
+                implemented_properties.append("dipole")
+            return calculator
+        elif self.calculator_type == "mace_mp":
+            from mace.calculators import mace_mp
+
+            return mace_mp(
+                model=self.model,
+                device=self.device,
+                default_dtype=self.default_dtype,
+                dispersion=self.dispersion,
+                damping=self.damping,
+                dispersion_xc=self.dispersion_xc,
+                dispersion_cutoff=self.dispersion_cutoff,
+            )
+        elif self.calculator_type == "mace_off":
+            from mace.calculators import mace_off
+
+            return mace_off(
+                model=self.model,
+                device=self.device,
+                default_dtype=self.default_dtype,
+            )
+        elif self.calculator_type == "mace_anicc":
+            from mace.calculators import mace_anicc
+
+            return mace_anicc(
+                device=self.device,
+                model_path=self.model,
+            )
+        else:
+            raise ValueError(
+                "Invalid calculator_type. Choose 'mace_polar', 'mace_mp', "
+                "'mace_off', or 'mace_anicc'."
+            )

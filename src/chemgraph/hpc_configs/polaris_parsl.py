@@ -1,0 +1,73 @@
+import os
+from parsl.config import Config
+from parsl.providers import LocalProvider
+from parsl.executors import HighThroughputExecutor
+from parsl.launchers import MpiExecLauncher
+
+from chemgraph.hpc_configs.loader import resolve_worker_init
+
+
+def get_polaris_config(
+    run_dir=None,
+    worker_init: str | None = None,
+):
+    """Generate the Parsl configuration for the Polaris supercomputer.
+
+    Parameters
+    ----------
+    run_dir : str, optional
+        Directory used as Parsl's run directory.
+    worker_init : str, optional
+        Explicit shell snippet for worker init. When ``None`` (default),
+        :func:`resolve_worker_init` picks ``CHEMGRAPH_WORKER_INIT`` /
+        ``VIRTUAL_ENV`` / ``CONDA_PREFIX`` over a bare ``export TMPDIR=/tmp``
+        fallback.
+
+    Returns
+    -------
+    parsl.config.Config
+        Configured Parsl ``Config`` for Polaris.
+    """
+    if run_dir is None:
+        run_dir = os.getcwd()
+
+    if worker_init is None:
+        worker_init = resolve_worker_init(run_dir, fallback="true")
+
+    # Get the number of nodes from the PBS environment
+    node_file = os.getenv("PBS_NODEFILE")
+    if node_file and os.path.exists(node_file):
+        with open(node_file, "r", encoding="utf-8") as f:
+            node_list = f.readlines()
+            num_nodes = len(node_list)
+    else:
+        # Fallback for testing/local runs without PBS
+        print("Warning: PBS_NODEFILE not found. Defaulting to 1 node.")
+        num_nodes = 1
+
+    config = Config(
+        executors=[
+            HighThroughputExecutor(
+                label="htex",
+                heartbeat_period=30,
+                heartbeat_threshold=360,
+                worker_debug=True,
+                available_accelerators=4,
+                cpu_affinity="list:24-31,56-63:16-23,48-55:8-15,40-47:0-7,32-39",
+                prefetch_capacity=0,
+                provider=LocalProvider(
+                    launcher=MpiExecLauncher(
+                        bind_cmd="--cpu-bind", overrides="--depth=1 --ppn 1"
+                    ),
+                    worker_init=worker_init,
+                    nodes_per_block=num_nodes,
+                    init_blocks=1,
+                    min_blocks=0,
+                    max_blocks=1,
+                ),
+            ),
+        ],
+        run_dir=run_dir,
+    )
+
+    return config

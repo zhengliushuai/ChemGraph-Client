@@ -1,0 +1,104 @@
+"""Parsl-oriented MACE helpers.
+
+``run_mace_core`` converts the MACE-specific input schema to
+:class:`ASEInputSchema` and delegates to :func:`chemgraph.tools.ase_core.run_ase_core`.
+"""
+
+from __future__ import annotations
+
+import logging
+
+from chemgraph.schemas.ase_input import ASEInputSchema
+from chemgraph.schemas.mace_parsl_schema import (
+    mace_input_schema,
+    mace_output_schema,
+)
+from chemgraph.tools.ase_core import run_ase_core, _resolve_existing_path
+
+# Re-export schemas so existing ``from chemgraph.tools.parsl_tools import …``
+# statements continue to work.
+__all__ = [
+    "mace_input_schema",
+    "mace_output_schema",
+    "run_mace_core",
+    "extract_output_json",
+]
+
+logger = logging.getLogger(__name__)
+
+
+def _result_potential_energy(result: dict) -> float | None:
+    """Return canonical energy with a fallback for legacy tool results."""
+    potential_energy = result.get("potential_energy")
+    if potential_energy is not None:
+        return potential_energy
+    return result.get("single_point_energy")
+
+
+# ---------------------------------------------------------------------------
+# Core execution — delegates to the unified implementation
+# ---------------------------------------------------------------------------
+
+
+def _mace_input_to_ase_input(params: mace_input_schema) -> ASEInputSchema:
+    """Convert a MACE-specific input schema to a generic ASEInputSchema.
+
+    Parameters
+    ----------
+    params : mace_input_schema
+        MACE-specific tool input.
+
+    Returns
+    -------
+    ASEInputSchema
+        Equivalent generic ASE input.
+    """
+    return ASEInputSchema(
+        input_structure_file=params.input_structure_file,
+        output_results_file=params.output_result_file,
+        driver=params.driver,
+        optimizer=params.optimizer,
+        calculator={
+            "calculator_type": "mace_mp",
+            "model": params.model,
+            "device": params.device,
+        },
+        fmax=params.fmax,
+        steps=params.steps,
+        temperature=params.temperature,
+        pressure=params.pressure,
+    )
+
+
+def run_mace_core(params: mace_input_schema) -> dict:
+    """Run a single MACE calculation.
+
+    Converts the MACE-specific schema to :class:`ASEInputSchema` and
+    delegates to :func:`chemgraph.tools.ase_core.run_ase_core`.
+
+    Parameters
+    ----------
+    params : mace_input_schema
+        MACE-specific input parameters.
+
+    Returns
+    -------
+    dict
+        Simulation result payload.
+    """
+    ase_params = _mace_input_to_ase_input(params)
+    return run_ase_core(ase_params)
+
+
+def extract_output_json(json_file: str) -> dict:
+    """Load simulation results from a JSON file produced by run_ase."""
+    import json
+
+    # Match run_ase's _resolve_path write location for bare relative names.
+    json_file = _resolve_existing_path(json_file)
+    try:
+        with open(json_file, "r") as f:
+            ret = json.load(f)
+    except Exception:
+        ret = {}
+    return ret
