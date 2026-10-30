@@ -2,6 +2,8 @@
   <img src="logo/chemgraph-color-dark__rgb-hires.jpg" alt="ChemGraph logo" width="240">
 </p>
 
+English | [简体中文](README_CN.md)
+
 [![Tests](https://github.com/argonne-lcf/ChemGraph/actions/workflows/tests.yml/badge.svg)](https://github.com/argonne-lcf/ChemGraph/actions/workflows/tests.yml)
 [![PyPI](https://img.shields.io/pypi/v/chemgraph.svg)](https://pypi.org/project/chemgraph/)
 [![Python](https://img.shields.io/pypi/pyversions/chemgraph.svg)](https://pypi.org/project/chemgraph/)
@@ -10,7 +12,18 @@
 [![Leaderboard](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Leaderboard-FFD21E)](https://huggingface.co/spaces/Autonomous-Scientific-Agents/chemgraph-leaderboard)
 [![License](https://img.shields.io/github/license/argonne-lcf/ChemGraph)](LICENSE)
 
-# ChemGraph
+# ChemGraph Client
+
+This repository is a **client-side build** of
+[argonne-lcf/ChemGraph](https://github.com/argonne-lcf/ChemGraph) (upstream
+v0.7.0). On top of upstream it adds local/remote compute collaboration:
+
+- **Compute-location toggle**: the Streamlit sidebar switches between local
+  tools and a user-editable remote MCP server, with a live health probe.
+- **Remote artifact mirroring**: files produced by remote computations
+  (xyz / traj / json / ...) are pulled back to the local machine, so the
+  download buttons, artifact manifest, and 3D viewer behave identically for
+  local and remote runs.
 
 ChemGraph is an agent framework for computational chemistry and materials
 science. It connects natural-language requests to molecular construction,
@@ -226,6 +239,60 @@ chemgraph run \
 
 See [MCP servers](https://argonne-lcf.github.io/ChemGraph/mcp_servers/) for
 stdio client configuration and the experimental HPC servers.
+
+### Run computations on a remote server
+
+Offload heavy work (MACE frequencies, batch screening) to another machine on
+the LAN. The local machine only runs the interface and the LLM decisions.
+
+**Server side** (the high-performance machine):
+
+```bash
+# Linux / macOS
+CHEMGRAPH_LOG_DIR=/path/to/artifacts \
+.venv/bin/python -m chemgraph.mcp.mcp_tools \
+  --transport streamable_http --host 0.0.0.0 --port 9003
+
+# Windows
+set CHEMGRAPH_LOG_DIR=E:\PyEnvs\chemgraph
+.venv\Scripts\python.exe -m chemgraph.mcp.mcp_tools --transport streamable_http --host 0.0.0.0 --port 9003
+```
+
+Notes:
+
+- `--host 0.0.0.0` is required to accept LAN connections (`127.0.0.1` only
+  listens locally); open port 9003 in the firewall.
+- The MCP endpoint is fixed at `http://<server-ip>:9003/mcp/`.
+- Two artifact channels back to clients: the `read_artifact` MCP tool (lets
+  the agent inspect small files) and `GET /artifacts/<filename>` (bulk
+  download of larger files). Both are confined to the artifact root and
+  reject path traversal.
+
+**Client option 1 — Streamlit toggle (recommended):** the sidebar
+**🖥️ Compute Location** widget switches between local tools and a remote
+endpoint. The endpoint field accepts shorthand like `192.168.12.44:9003`
+(the `/mcp/` path is appended automatically) and applies on Enter. A health
+dot shows 🟢 reachable / 🔴 unreachable; an unreachable endpoint stays on
+local compute instead of failing silently.
+
+**Client option 2 — CLI / config:** as shown above with `--mcp-url`, or
+persist the connection in `config.toml`:
+
+```toml
+[mcp]
+url = "http://192.168.12.44:9003/mcp/"
+server_name = "ChemGraph Remote Tools"
+```
+
+When the Streamlit UI runs against a remote endpoint, artifacts are mirrored
+automatically into the session directory (`remote_artifacts/`) and the paths
+in tool results are rewritten to the local copies. The CLI keeps files on the
+server side — copy them back manually.
+
+**Trade-offs:** remote mode frees local resources and lets a laptop run large
+jobs, but it depends on the network and the server being up (no automatic
+fallback — switch back to local manually), and the endpoint has no
+authentication, so keep it on a trusted LAN.
 
 ## Choose a workflow
 
